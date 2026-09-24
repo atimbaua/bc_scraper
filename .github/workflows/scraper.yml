@@ -21,6 +21,7 @@ jobs:
       - name: Установка зависимостей
         run: |
           pip install requests beautifulsoup4
+          pip install requests beautifulsoup4 cloudscraper
 
       - name: Запуск автопостинга
         env:
