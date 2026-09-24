@@ -32,11 +32,12 @@ def save_posted(posted_set):
         json.dump(list(posted_set), f, ensure_ascii=False, indent=2)
 
 def fetch_html(target_url):
-    """Получает HTML страницы с использованием ScraperAPI, Cloudflare Worker или напрямую."""
+    """Универсально запрашивает любую страницу через ScraperAPI, Worker или напрямую."""
     if SCRAPERAPI_KEY:
         req_url = f"http://api.scraperapi.com?api_key={SCRAPERAPI_KEY}&url={target_url}"
     elif CLOUDFLARE_WORKER_URL:
-        req_url = CLOUDFLARE_WORKER_URL
+        sep = "&" if "?" in CLOUDFLARE_WORKER_URL else "?"
+        req_url = f"{CLOUDFLARE_WORKER_URL}{sep}url={target_url}"
     else:
         req_url = target_url
 
@@ -47,20 +48,12 @@ def fetch_html(target_url):
         print(f"Ошибка сетевого запроса: {e}")
         return None
 
-def extract_urls_from_json(obj):
-    """Рекурсивно ищет ссылки на альбомы и треки внутри JSON-структуры Bandcamp."""
-    urls = []
-    if isinstance(obj, dict):
-        for key, value in obj.items():
-            if key in ("item_url", "tralbum_url", "page_url", "url") and isinstance(value, str):
-                if "/album/" in value or "/track/" in value:
-                    urls.append(value)
-            else:
-                urls.extend(extract_urls_from_json(value))
-    elif isinstance(obj, list):
-        for item in obj:
-            urls.extend(extract_urls_from_json(item))
-    return urls
+def clean_and_unescape(text):
+    """Очищает текст от всех типов экранирования в Bandcamp (JSON/Unicode)."""
+    text = text.replace(r'\/', '/').replace(r'\\/', '/')
+    text = text.replace(r'\u002f', '/').replace(r'\u002F', '/')
+    text = text.replace('&amp;', '&')
+    return text
 
 def get_new_ambient_releases():
     """Собирает ссылки на новые Ambient релизы с Bandcamp."""
@@ -73,35 +66,31 @@ def get_new_ambient_releases():
 
     print(f"[Bandcamp Page] Статус: {res.status_code}, Размер: {len(res.text)} байт")
 
-    if res.status_code == 200 and len(res.text) > 10000:
-        soup = BeautifulSoup(res.text, "html.parser")
+    if res.status_code == 200 and len(res.text) > 5000:
+        clean_text = clean_and_unescape(res.text)
 
-        # Способ 1: Парсинг дата-блоба JSON
-        pagedata = soup.find(id="pagedata") or soup.find(attrs={"data-blob": True})
-        if pagedata and pagedata.get("data-blob"):
-            try:
-                blob_data = json.loads(pagedata["data-blob"])
-                extracted_json_urls = extract_urls_from_json(blob_data)
-                for url in extracted_json_urls:
-                    clean_url = url.split("?")[0]
-                    if not clean_url.startswith("https://bandcamp.com/"):
-                        releases.append(clean_url)
-                print(f"Извлечено из JSON data-blob: {len(releases)} релизов")
-            except Exception as e:
-                print(f"Ошибка разбора JSON data-blob: {e}")
+        # Вытаскиваем абсолютно все URL-подобные строки из кода страницы
+        raw_urls = re.findall(r'https?://[^\s"<>\'\\]+', clean_text)
 
-        # Способ 2: Запасной поиск через исправленное регулярное выражение
-        clean_text = res.text.replace(r'\/', '/').replace(r'\\/', '/')
-        pattern = r'https://[a-zA-Z0-9\.-]+\.bandcamp\.com/(?:album|track)/[a-zA-Z0-9%_\.-]+'
-        found_urls = re.findall(pattern, clean_text)
-
-        for link in found_urls:
-            clean_link = link.split("?")[0]
-            if not clean_link.startswith("https://bandcamp.com/"):
-                releases.append(clean_link)
+        for url in raw_urls:
+            url = url.rstrip('.,;)"\'')
+            # Фильтруем только ссылки на альбомы и треки
+            if '/album/' in url or '/track/' in url:
+                # Очищаем от параметров запроса (?from=...)
+                clean_url = url.split('?')[0].split('#')[0]
+                # Исключаем служебные страницы самого bandcamp.com
+                if not clean_url.startswith('https://bandcamp.com/'):
+                    releases.append(clean_url)
 
     unique_releases = list(dict.fromkeys(releases))
-    print(f"Итого найдено уникальных релизов: {len(unique_releases)}")
+    print(f"Итого найдено релизов: {len(unique_releases)}")
+
+    # Диагностика на случай, если ничего не найдено
+    if not unique_releases and len(res.text) > 0:
+        print("[DEBUG] Диагностика страницы:")
+        print(f"Содержит '/album/': {'/album/' in res.text}")
+        print(f"Содержит '/track/': {'/track/' in res.text}")
+
     return unique_releases
 
 def fetch_release_details(url):
@@ -163,7 +152,7 @@ def send_to_telegram(release):
 
 def main():
     if not TELEGRAM_BOT_TOKEN:
-        print("Ошибка: Не задан TELEGRAM_BOT_TOKEN")
+        print(" Ошибка: Не задан TELEGRAM_BOT_TOKEN")
         return
 
     posted = load_posted()
