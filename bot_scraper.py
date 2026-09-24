@@ -1,5 +1,5 @@
-import re
 import os
+import re
 import json
 import html
 import requests
@@ -10,7 +10,9 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "@bc_ambient")
 POSTED_FILE = "posted_releases.json"
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.5"
 }
 
 def load_posted():
@@ -29,50 +31,81 @@ def save_posted(posted_set):
         json.dump(list(posted_set), f, ensure_ascii=False, indent=2)
 
 def get_new_ambient_releases():
-    """Собирает ссылки на новые Ambient релизы с Bandcamp."""
-    url = "https://bandcamp.com/tag/ambient?sort_field=date"
-    response = requests.get(url, headers=HEADERS, timeout=15)
-    
-    if response.status_code != 200:
-        print(f"Ошибка запроса Bandcamp: {response.status_code}")
-        return []
-
-    soup = BeautifulSoup(response.text, "html.parser")
+    """Собирает ссылки на новые Ambient релизы с Bandcamp через API и HTML."""
     releases = []
 
-    # Способ 1: Парсинг встроенного JSON (data-blob)
-    pagedata = soup.find(id="pagedata")
-    if pagedata and pagedata.get("data-blob"):
+    # --- Способ 1: Прямой запрос к внутреннему API Bandcamp ---
+    api_url = "https://bandcamp.com/api/hub/2/dig_deeper"
+    api_headers = {
+        **HEADERS,
+        "Accept": "application/json, text/plain, */*",
+        "Content-Type": "application/json",
+        "Referer": "https://bandcamp.com/tag/ambient?sort_field=date",
+        "Origin": "https://bandcamp.com"
+    }
+    
+    payloads = [
+        {"tag": "ambient", "page": 0, "sort": "date"},
+        {"tag_id": "ambient", "page": 0, "sort": "date"}
+    ]
+
+    for idx, payload in enumerate(payloads, 1):
         try:
-            blob_data = json.loads(pagedata["data-blob"])
-            # Извлекаем элементы из дисковера Bandcamp
-            items = (
-                blob_data.get("hub_data", {}).get("dig_deeper", {}).get("items", []) or
-                blob_data.get("tab_data", {}).get("items", [])
-            )
-            for item in items:
-                link = item.get("tralbum_url") or item.get("item_url")
-                if link:
-                    releases.append(link.split("?")[0])
+            res = requests.post(api_url, json=payload, headers=api_headers, timeout=15)
+            print(f"[API {idx}] Код ответа: {res.status_code}, размер: {len(res.text)} байт")
+            if res.status_code == 200:
+                data = res.json()
+                items = data.get("items", []) or data.get("results", [])
+                for item in items:
+                    link = item.get("tralbum_url") or item.get("item_url")
+                    if link:
+                        clean_link = link.split("?")[0]
+                        releases.append(clean_link)
+                if releases:
+                    print(f" Успешно получено через API Bandcamp: {len(releases)} релизов")
+                    return list(dict.fromkeys(releases))
         except Exception as e:
-            print(f"Ошибка разбора data-blob: {e}")
+            print(f" Ошибка API ({idx}): {e}")
 
-    # Способ 2 (Резервный): Сканирование сырого текста страницы с помощью регулярных выражений
-    if not releases:
-        print("Поиск через JSON не дал результатов, задействуем регулярное выражение...")
-        pattern = r'https?://[a-zA-Z0-9-]+\.bandcamp\.com/(?:album|track)/[a-zA-Z0-9_-]+'
-        found_urls = re.findall(pattern, response.text)
-        for link in found_urls:
-            clean_link = link.split("?")[0]
-            releases.append(clean_link)
+    # --- Способ 2: Запасной парсинг HTML с разэкранированием ссылок ---
+    print("API не вернул данные, задействуем сканирование HTML...")
+    html_url = "https://bandcamp.com/tag/ambient?sort_field=date"
+    try:
+        res = requests.get(html_url, headers=HEADERS, timeout=15)
+        print(f"[HTML] Код ответа: {res.status_code}, размер: {len(res.text)} байт")
 
-    # Удаление дубликатов с сохранением порядка
+        if res.status_code == 200:
+            # ВАЖНО: Разэкранируем слэши (https:\/\/... -> https://...)
+            clean_text = res.text.replace(r'\/', '/')
+
+            # Поиск всех ссылок на альбомы и треки (включая поддомены)
+            pattern = r'https://[a-zA-Z0-9\.-]+\.bandcamp\.com/(?:album|track)/[a-zA-Z0-9%_-]+'
+            found_urls = re.findall(pattern, clean_text)
+
+            for link in found_urls:
+                clean_link = link.split("?")[0]
+                releases.append(clean_link)
+
+            # Если regex не сработал, ищем обычные теги <a>
+            if not releases:
+                soup = BeautifulSoup(res.text, "html.parser")
+                for a in soup.find_all("a", href=True):
+                    href = a["href"]
+                    if "/album/" in href or "/track/" in href:
+                        if href.startswith("//"):
+                            href = "https:" + href
+                        elif href.startswith("/"):
+                            href = "https://bandcamp.com" + href
+                        releases.append(href.split("?")[0])
+    except Exception as e:
+        print(f" Ошибка HTML: {e}")
+
     unique_releases = list(dict.fromkeys(releases))
-    print(f"Найдено релизов на Bandcamp: {len(unique_releases)}")
+    print(f"Итого найдено релизов: {len(unique_releases)}")
     return unique_releases
 
 def fetch_release_details(url):
-    """Извлекает детальные метаданные (обложку, описание, исполнителя) со страницы релиза."""
+    """Извлекает детальные метаданные со страницы релиза."""
     try:
         res = requests.get(url, headers=HEADERS, timeout=15)
         if res.status_code != 200:
@@ -80,7 +113,6 @@ def fetch_release_details(url):
 
         soup = BeautifulSoup(res.text, "html.parser")
 
-        # Парсинг OpenGraph / Meta-тегов
         og_title = soup.find("meta", property="og:title")
         og_image = soup.find("meta", property="og:image")
         og_desc = soup.find("meta", property="og:description")
@@ -89,7 +121,6 @@ def fetch_release_details(url):
         image_url = og_image["content"] if og_image else ""
         description = og_desc["content"] if og_desc else ""
 
-        # Извлечение тегов релиза
         tags = [t.get_text(strip=True) for t in soup.select("a.tag")]
 
         return {
@@ -104,16 +135,14 @@ def fetch_release_details(url):
         return None
 
 def send_to_telegram(release):
-    """Форматирует сообщение и отправляет его в Telegram-канал."""
+    """Отправляет пост в Telegram."""
     api_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
 
-    # Экранирование HTML-символов во избежание ошибок разметки
     title = html.escape(release["title_full"])
     desc = html.escape(release["description"][:300])
     if len(release["description"]) > 300:
         desc += "..."
 
-    # Формирование хэштегов
     tags_list = [f"#{t.lower().replace('-', '_').replace(' ', '_')}" for t in release["tags"]]
     if "#ambient" not in tags_list:
         tags_list.insert(0, "#ambient")
@@ -138,14 +167,14 @@ def send_to_telegram(release):
 
 def main():
     if not TELEGRAM_BOT_TOKEN:
-        print("Ошибка: Не задан TELEGRAM_BOT_TOKEN")
+        print(" Ошибка: Не задан TELEGRAM_BOT_TOKEN")
         return
 
     posted = load_posted()
     release_links = get_new_ambient_releases()
 
     new_posts = 0
-    # Обрабатываем в обратном порядке (от более старых к самым новым)
+    # Публикуем снизу вверх (от более старых к свежим)
     for link in reversed(release_links):
         if link in posted:
             continue
