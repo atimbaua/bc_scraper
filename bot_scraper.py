@@ -5,6 +5,13 @@ import html
 import requests
 from bs4 import BeautifulSoup
 
+# Попытка импорта curl_cffi (если установлен)
+try:
+    from curl_cffi import requests as curl_requests
+    CURL_CFFI_AVAILABLE = True
+except ImportError:
+    CURL_CFFI_AVAILABLE = False
+
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "@bc_ambient")
 SCRAPERAPI_KEY = os.getenv("SCRAPERAPI_KEY")
@@ -13,7 +20,9 @@ CLOUDFLARE_WORKER_URL = os.getenv("CLOUDFLARE_WORKER_URL")
 POSTED_FILE = "posted_releases.json"
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
 }
 
 def load_posted():
@@ -32,83 +41,113 @@ def save_posted(posted_set):
         json.dump(list(posted_set), f, ensure_ascii=False, indent=2)
 
 def fetch_html(target_url):
-    """Универсально запрашивает страницу через ScraperAPI, Cloudflare Worker или напрямую."""
+    """Получает HTML страницы с использованием ScraperAPI, curl_cffi или Cloudflare Worker."""
+    # 1. ScraperAPI (если задан)
     if SCRAPERAPI_KEY:
         print(" [СПОСОБ ЗАПРОСА]: Используется ScraperAPI")
         req_url = f"http://api.scraperapi.com?api_key={SCRAPERAPI_KEY}&url={target_url}"
-    elif CLOUDFLARE_WORKER_URL:
+        try:
+            res = requests.get(req_url, headers=HEADERS, timeout=30)
+            if res.status_code == 200:
+                return res.text
+        except Exception as e:
+            print(f"Ошибка ScraperAPI: {e}")
+
+    # 2. curl_cffi (если установлен)
+    if CURL_CFFI_AVAILABLE:
+        print(" [СПОСОБ ЗАПРОСА]: Используется curl_cffi (Chrome 120)")
+        try:
+            res = curl_requests.get(target_url, headers=HEADERS, impersonate="chrome120", timeout=30)
+            if res.status_code == 200:
+                return res.text
+        except Exception as e:
+            print(f"Ошибка curl_cffi: {e}")
+
+    # 3. Cloudflare Worker (если задан)
+    if CLOUDFLARE_WORKER_URL:
         print(" [СПОСОБ ЗАПРОСА]: Используется Cloudflare Worker")
         sep = "&" if "?" in CLOUDFLARE_WORKER_URL else "?"
         req_url = f"{CLOUDFLARE_WORKER_URL}{sep}url={target_url}"
-    else:
-        print("⚠️ [ВНИМАНИЕ]: Прокси не задан! Запрос идет напрямую с GitHub (высокий риск блокировки Cloudflare)")
-        req_url = target_url
+        try:
+            res = requests.get(req_url, headers=HEADERS, timeout=30)
+            if res.status_code == 200:
+                return res.text
+        except Exception as e:
+            print(f"Ошибка Worker: {e}")
 
+    # 4. Прямой запрос (резервный)
+    print("⚠️ [ВНИМАНИЕ]: Прямой запрос без прокси")
     try:
-        res = requests.get(req_url, headers=HEADERS, timeout=30)
-        return res
+        res = requests.get(target_url, headers=HEADERS, timeout=30)
+        return res.text if res.status_code == 200 else None
     except Exception as e:
-        print(f" Ошибка сетевого запроса: {e}")
+        print(f"Ошибка прямого запроса: {e}")
         return None
 
-def clean_and_unescape(text):
-    """Очищает текст от всех типов экранирования в Bandcamp (JSON/Unicode)."""
-    text = text.replace(r'\/', '/').replace(r'\\/', '/')
-    text = text.replace(r'\u002f', '/').replace(r'\u002F', '/')
-    text = text.replace('&amp;', '&')
-    return text
+def extract_urls_from_json(obj):
+    """Рекурсивно извлекает ссылки на релизы из JSON структуры Bandcamp."""
+    urls = []
+    if isinstance(obj, dict):
+        for key, value in obj.items():
+            if key in ("item_url", "tralbum_url", "page_url", "url") and isinstance(value, str):
+                if "/album/" in value or "/track/" in value:
+                    urls.append(value)
+            else:
+                urls.extend(extract_urls_from_json(value))
+    elif isinstance(obj, list):
+        for item in obj:
+            urls.extend(extract_urls_from_json(item))
+    return urls
 
 def get_new_ambient_releases():
     """Собирает ссылки на новые Ambient релизы с Bandcamp."""
     releases = []
     target_url = "https://bandcamp.com/tag/ambient?sort_field=date"
     
-    res = fetch_html(target_url)
-    if not res:
+    html_text = fetch_html(target_url)
+    if not html_text:
+        print("❌ Не удалось загрузить страницу Bandcamp.")
         return []
 
-    print(f"[Bandcamp Page] Статус: {res.status_code}, Размер: {len(res.text)} байт")
+    print(f"[Bandcamp Page] Успешно загружено: {len(html_text)} байт")
 
-    if res.status_code == 200:
-        if len(res.text) <= 5000:
-            print("❌ Ошибка: Получена заглушка Cloudflare (размер < 5 КБ). Прокси не сработал или не настроен.")
-            return []
+    soup = BeautifulSoup(html_text, "html.parser")
 
-        clean_text = clean_and_unescape(res.text)
+    # Метод 1: Извлечение из data-blob (JSON контейнер Bandcamp)
+    pagedata = soup.find(attrs={"data-blob": True})
+    if pagedata and pagedata.get("data-blob"):
+        try:
+            blob_data = json.loads(pagedata["data-blob"])
+            json_urls = extract_urls_from_json(blob_data)
+            releases.extend(json_urls)
+            print(f"Извлечено из JSON data-blob: {len(json_urls)} ссылок")
+        except Exception as e:
+            print(f"Ошибка разбора data-blob: {e}")
 
-        # Способ 1: Поиск по открытым тегам <a>
-        soup = BeautifulSoup(clean_text, "html.parser")
-        for a in soup.find_all("a", href=True):
-            href = a["href"]
-            if "/album/" in href or "/track/" in href:
-                clean_url = href.split("?")[0].split("#")[0]
-                if clean_url.startswith("//"):
-                    clean_url = "https:" + clean_url
-                elif clean_url.startswith("/"):
-                    clean_url = "https://bandcamp.com" + clean_url
-                
-                if not clean_url.startswith("https://bandcamp.com/"):
-                    releases.append(clean_url)
+    # Метод 2: Резервный поиск Regex по всему тексту страницы
+    clean_text = html.unescape(html_text).replace(r'\/', '/').replace(r'\\/', '/')
+    pattern = r'https?://[a-zA-Z0-9.-]+\.bandcamp\.com/(?:album|track)/[^\s"\'<>\\?#]+'
+    found_urls = re.findall(pattern, clean_text)
+    releases.extend(found_urls)
 
-        # Способ 2: Запасной поиск всех URL регулярными выражениями
-        if not releases:
-            raw_urls = re.findall(r'https?://[a-zA-Z0-9\.-]+\.bandcamp\.com/(?:album|track)/[a-zA-Z0-9%_\.-]+', clean_text)
-            for url in raw_urls:
-                clean_url = url.split('?')[0].split('#')[0]
-                if not clean_url.startswith('https://bandcamp.com/'):
-                    releases.append(clean_url)
+    # Фильтрация и очистка ссылок
+    cleaned_releases = []
+    for url in releases:
+        clean_url = url.split("?")[0].split("#")[0].rstrip('.,;)"\'')
+        if not clean_url.startswith("https://bandcamp.com/") and not clean_url.startswith("http://bandcamp.com/"):
+            cleaned_releases.append(clean_url)
 
-    unique_releases = list(dict.fromkeys(releases))
-    print(f"Итого найдено релизов: {len(unique_releases)}")
+    unique_releases = list(dict.fromkeys(cleaned_releases))
+    print(f"Итого найдено уникальных релизов: {len(unique_releases)}")
     return unique_releases
 
 def fetch_release_details(url):
     """Извлекает обложку, название и описание конкретного альбома."""
-    res = fetch_html(url)
-    if not res or res.status_code != 200:
+    html_text = fetch_html(url)
+    if not html_text:
         return None
 
-    soup = BeautifulSoup(res.text, "html.parser")
+    soup = BeautifulSoup(html_text, "html.parser")
 
     og_title = soup.find("meta", property="og:title")
     og_image = soup.find("meta", property="og:image")
