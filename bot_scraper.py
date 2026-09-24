@@ -8,7 +8,6 @@ from bs4 import BeautifulSoup
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "@bc_ambient")
 SCRAPERAPI_KEY = os.getenv("SCRAPERAPI_KEY")
-# Если используете Cloudflare Worker, вставьте его URL в кавычки ниже:
 CLOUDFLARE_WORKER_URL = os.getenv("CLOUDFLARE_WORKER_URL", "")
 
 POSTED_FILE = "posted_releases.json"
@@ -48,6 +47,21 @@ def fetch_html(target_url):
         print(f"Ошибка сетевого запроса: {e}")
         return None
 
+def extract_urls_from_json(obj):
+    """Рекурсивно ищет ссылки на альбомы и треки внутри JSON-структуры Bandcamp."""
+    urls = []
+    if isinstance(obj, dict):
+        for key, value in obj.items():
+            if key in ("item_url", "tralbum_url", "page_url", "url") and isinstance(value, str):
+                if "/album/" in value or "/track/" in value:
+                    urls.append(value)
+            else:
+                urls.extend(extract_urls_from_json(value))
+    elif isinstance(obj, list):
+        for item in obj:
+            urls.extend(extract_urls_from_json(item))
+    return urls
+
 def get_new_ambient_releases():
     """Собирает ссылки на новые Ambient релизы с Bandcamp."""
     releases = []
@@ -60,19 +74,34 @@ def get_new_ambient_releases():
     print(f"[Bandcamp Page] Статус: {res.status_code}, Размер: {len(res.text)} байт")
 
     if res.status_code == 200 and len(res.text) > 10000:
-        clean_text = res.text.replace(r'\/', '/')
-        
-        # Поиск ссылок через регулярные выражения
-        pattern = r'https://[a-zA-Z0-9\.-]+\.bandcamp\.com/(?:album|track)/[a-zA-Z0-9%_-]+'
+        soup = BeautifulSoup(res.text, "html.parser")
+
+        # Способ 1: Парсинг дата-блоба JSON
+        pagedata = soup.find(id="pagedata") or soup.find(attrs={"data-blob": True})
+        if pagedata and pagedata.get("data-blob"):
+            try:
+                blob_data = json.loads(pagedata["data-blob"])
+                extracted_json_urls = extract_urls_from_json(blob_data)
+                for url in extracted_json_urls:
+                    clean_url = url.split("?")[0]
+                    if not clean_url.startswith("https://bandcamp.com/"):
+                        releases.append(clean_url)
+                print(f"Извлечено из JSON data-blob: {len(releases)} релизов")
+            except Exception as e:
+                print(f"Ошибка разбора JSON data-blob: {e}")
+
+        # Способ 2: Запасной поиск через исправленное регулярное выражение
+        clean_text = res.text.replace(r'\/', '/').replace(r'\\/', '/')
+        pattern = r'https://[a-zA-Z0-9\.-]+\.bandcamp\.com/(?:album|track)/[a-zA-Z0-9%_\.-]+'
         found_urls = re.findall(pattern, clean_text)
-        
+
         for link in found_urls:
             clean_link = link.split("?")[0]
             if not clean_link.startswith("https://bandcamp.com/"):
                 releases.append(clean_link)
 
     unique_releases = list(dict.fromkeys(releases))
-    print(f"Итого найдено релизов: {len(unique_releases)}")
+    print(f"Итого найдено уникальных релизов: {len(unique_releases)}")
     return unique_releases
 
 def fetch_release_details(url):
@@ -134,7 +163,7 @@ def send_to_telegram(release):
 
 def main():
     if not TELEGRAM_BOT_TOKEN:
-        print(" Ошибка: Не задан TELEGRAM_BOT_TOKEN")
+        print("Ошибка: Не задан TELEGRAM_BOT_TOKEN")
         return
 
     posted = load_posted()
