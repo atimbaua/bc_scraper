@@ -2,18 +2,19 @@ import os
 import re
 import json
 import html
-import requests  # Для Telegram API
-from curl_cffi import requests as crequests  # Обходит защиту Cloudflare TLS Fingerprint
+import requests
 from bs4 import BeautifulSoup
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "@bc_ambient")
+SCRAPERAPI_KEY = os.getenv("SCRAPERAPI_KEY")
+# Если используете Cloudflare Worker, вставьте его URL в кавычки ниже:
+CLOUDFLARE_WORKER_URL = os.getenv("CLOUDFLARE_WORKER_URL", "")
+
 POSTED_FILE = "posted_releases.json"
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.9",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 }
 
 def load_posted():
@@ -31,105 +32,74 @@ def save_posted(posted_set):
     with open(POSTED_FILE, "w", encoding="utf-8") as f:
         json.dump(list(posted_set), f, ensure_ascii=False, indent=2)
 
+def fetch_html(target_url):
+    """Получает HTML страницы с использованием ScraperAPI, Cloudflare Worker или напрямую."""
+    if SCRAPERAPI_KEY:
+        req_url = f"http://api.scraperapi.com?api_key={SCRAPERAPI_KEY}&url={target_url}"
+    elif CLOUDFLARE_WORKER_URL:
+        req_url = CLOUDFLARE_WORKER_URL
+    else:
+        req_url = target_url
+
+    try:
+        res = requests.get(req_url, headers=HEADERS, timeout=30)
+        return res
+    except Exception as e:
+        print(f"Ошибка сетевого запроса: {e}")
+        return None
+
 def get_new_ambient_releases():
     """Собирает ссылки на новые Ambient релизы с Bandcamp."""
     releases = []
+    target_url = "https://bandcamp.com/tag/ambient?sort_field=date"
     
-    # 1. Запрос к странице тега ambient через скрейпер с подделкой TLS-отпечатка Chrome
-    url = "https://bandcamp.com/tag/ambient?sort_field=date"
-    try:
-        res = crequests.get(url, headers=HEADERS, impersonate="chrome124", timeout=20)
-        print(f"[Bandcamp Tag] Статус: {res.status_code}, Размер ответа: {len(res.text)} байт")
+    res = fetch_html(target_url)
+    if not res:
+        return []
 
-        if res.status_code == 200 and len(res.text) > 10000:
-            soup = BeautifulSoup(res.text, "html.parser")
-            
-            # Вариант А: Извлечение data-blob JSON
-            pagedata = soup.find(id="pagedata")
-            if pagedata and pagedata.get("data-blob"):
-                try:
-                    blob = json.loads(pagedata["data-blob"])
-                    hub = blob.get("hub_data", {})
-                    dig = hub.get("dig_deeper", {})
-                    items = dig.get("items", []) or blob.get("tab_data", {}).get("items", [])
-                    for item in items:
-                        link = item.get("tralbum_url") or item.get("item_url")
-                        if link:
-                            releases.append(link.split("?")[0])
-                    if releases:
-                        print(f" Извлечено из data-blob: {len(releases)} релизов")
-                except Exception as e:
-                    print(f" Ошибка разбора data-blob: {e}")
+    print(f"[Bandcamp Page] Статус: {res.status_code}, Размер: {len(res.text)} байт")
 
-            # Вариант Б: Сканирование регулярными выражениями по всему тексту страницы
-            clean_text = res.text.replace(r'\/', '/')
-            pattern = r'https://[a-zA-Z0-9\.-]+\.bandcamp\.com/(?:album|track)/[a-zA-Z0-9%_-]+'
-            found_urls = re.findall(pattern, clean_text)
-            for link in found_urls:
-                clean_link = link.split("?")[0]
-                if not clean_link.startswith("https://bandcamp.com/"):
-                    releases.append(clean_link)
-
-    except Exception as e:
-        print(f" Ошибка при запросе Bandcamp: {e}")
-
-    # Запасной способ: запрос к API с эмуляцией Chrome
-    if not releases:
-        print(" Страница пуста, пробуем API...")
-        api_url = "https://bandcamp.com/api/hub/2/dig_deeper"
-        payload = {"tag": "ambient", "page": 0, "sort": "date"}
-        try:
-            res = crequests.post(
-                api_url, 
-                json=payload, 
-                headers={**HEADERS, "Referer": "https://bandcamp.com/tag/ambient"},
-                impersonate="chrome124", 
-                timeout=20
-            )
-            print(f"[API] Статус: {res.status_code}, Размер: {len(res.text)} байт")
-            if res.status_code == 200:
-                data = res.json()
-                items = data.get("items", []) or data.get("results", [])
-                for item in items:
-                    link = item.get("tralbum_url") or item.get("item_url")
-                    if link:
-                        releases.append(link.split("?")[0])
-        except Exception as e:
-            print(f" Ошибка API: {e}")
+    if res.status_code == 200 and len(res.text) > 10000:
+        clean_text = res.text.replace(r'\/', '/')
+        
+        # Поиск ссылок через регулярные выражения
+        pattern = r'https://[a-zA-Z0-9\.-]+\.bandcamp\.com/(?:album|track)/[a-zA-Z0-9%_-]+'
+        found_urls = re.findall(pattern, clean_text)
+        
+        for link in found_urls:
+            clean_link = link.split("?")[0]
+            if not clean_link.startswith("https://bandcamp.com/"):
+                releases.append(clean_link)
 
     unique_releases = list(dict.fromkeys(releases))
     print(f"Итого найдено релизов: {len(unique_releases)}")
     return unique_releases
 
 def fetch_release_details(url):
-    """Извлекает обложку, название и описание релиза."""
-    try:
-        res = crequests.get(url, headers=HEADERS, impersonate="chrome124", timeout=20)
-        if res.status_code != 200:
-            return None
-
-        soup = BeautifulSoup(res.text, "html.parser")
-
-        og_title = soup.find("meta", property="og:title")
-        og_image = soup.find("meta", property="og:image")
-        og_desc = soup.find("meta", property="og:description")
-
-        title_full = og_title["content"] if og_title else "Ambient Release"
-        image_url = og_image["content"] if og_image else ""
-        description = og_desc["content"] if og_desc else ""
-
-        tags = [t.get_text(strip=True) for t in soup.select("a.tag")]
-
-        return {
-            "title_full": title_full,
-            "image": image_url,
-            "description": description,
-            "tags": tags[:6],
-            "link": url
-        }
-    except Exception as e:
-        print(f"Ошибка при обработке релиза {url}: {e}")
+    """Извлекает обложку, название и описание конкретного альбома."""
+    res = fetch_html(url)
+    if not res or res.status_code != 200:
         return None
+
+    soup = BeautifulSoup(res.text, "html.parser")
+
+    og_title = soup.find("meta", property="og:title")
+    og_image = soup.find("meta", property="og:image")
+    og_desc = soup.find("meta", property="og:description")
+
+    title_full = og_title["content"] if og_title else "Ambient Release"
+    image_url = og_image["content"] if og_image else ""
+    description = og_desc["content"] if og_desc else ""
+
+    tags = [t.get_text(strip=True) for t in soup.select("a.tag")]
+
+    return {
+        "title_full": title_full,
+        "image": image_url,
+        "description": description,
+        "tags": tags[:6],
+        "link": url
+    }
 
 def send_to_telegram(release):
     """Отправляет готовый пост в Telegram-канал."""
