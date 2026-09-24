@@ -5,7 +5,7 @@ import html
 import requests
 from bs4 import BeautifulSoup
 
-# Попытка импорта curl_cffi (если установлен)
+# Импорт curl_cffi для обхода Cloudflare
 try:
     from curl_cffi import requests as curl_requests
     CURL_CFFI_AVAILABLE = True
@@ -40,56 +40,67 @@ def save_posted(posted_set):
     with open(POSTED_FILE, "w", encoding="utf-8") as f:
         json.dump(list(posted_set), f, ensure_ascii=False, indent=2)
 
-def fetch_html(target_url):
-    """Получает HTML страницы с использованием ScraperAPI, curl_cffi или Cloudflare Worker."""
-    # 1. ScraperAPI (если задан)
-    if SCRAPERAPI_KEY:
-        print(" [СПОСОБ ЗАПРОСА]: Используется ScraperAPI")
-        req_url = f"http://api.scraperapi.com?api_key={SCRAPERAPI_KEY}&url={target_url}"
-        try:
-            res = requests.get(req_url, headers=HEADERS, timeout=30)
-            if res.status_code == 200:
-                return res.text
-        except Exception as e:
-            print(f"Ошибка ScraperAPI: {e}")
+def is_valid_bandcamp_page(text):
+    """Проверяет, что получен настоящий HTML Bandcamp, а не заглушка Cloudflare."""
+    if not text:
+        return False
+    return len(text) > 10000 and ("data-blob" in text or "bandcamp" in text.lower())
 
-    # 2. curl_cffi (если установлен)
+def fetch_html(target_url):
+    """
+    Каскадный запрос: пробует способы по очереди, пока не получит валидный HTML (>10 КБ).
+    """
+    # 1. Пробуем curl_cffi (Chrome 120) — бесплатно, прямо из GitHub Actions
     if CURL_CFFI_AVAILABLE:
-        print(" [СПОСОБ ЗАПРОСА]: Используется curl_cffi (Chrome 120)")
+        print(f" [СПОСОБ 1]: Пробуем curl_cffi (Chrome 120)...")
         try:
             res = curl_requests.get(target_url, headers=HEADERS, impersonate="chrome120", timeout=30)
-            if res.status_code == 200:
+            if res.status_code == 200 and is_valid_bandcamp_page(res.text):
+                print(f"    Успех через curl_cffi! Размер: {len(res.text)} байт")
                 return res.text
+            else:
+                size = len(res.text) if res.text else 0
+                print(f"   ⚠️ curl_cffi вернул размер {size} байт (недостаточно). Пробуем следующий метод...")
         except Exception as e:
-            print(f"Ошибка curl_cffi: {e}")
+            print(f"   ⚠️ Ошибка curl_cffi: {e}")
 
-    # 3. Cloudflare Worker (если задан)
+    # 2. Пробуем ScraperAPI с принудительным JS-рендерингом
+    if SCRAPERAPI_KEY:
+        print(f" [СПОСОБ 2]: Пробуем ScraperAPI (render=true)...")
+        req_url = f"http://api.scraperapi.com?api_key={SCRAPERAPI_KEY}&url={target_url}&render=true"
+        try:
+            res = requests.get(req_url, headers=HEADERS, timeout=60)
+            if res.status_code == 200 and is_valid_bandcamp_page(res.text):
+                print(f"    Успех через ScraperAPI! Размер: {len(res.text)} байт")
+                return res.text
+            else:
+                size = len(res.text) if res.text else 0
+                print(f"   ⚠️ ScraperAPI вернул размер {size} байт.")
+        except Exception as e:
+            print(f"   ⚠️ Ошибка ScraperAPI: {e}")
+
+    # 3. Пробуем Cloudflare Worker
     if CLOUDFLARE_WORKER_URL:
-        print(" [СПОСОБ ЗАПРОСА]: Используется Cloudflare Worker")
+        print(f" [СПОСОБ 3]: Пробуем Cloudflare Worker...")
         sep = "&" if "?" in CLOUDFLARE_WORKER_URL else "?"
         req_url = f"{CLOUDFLARE_WORKER_URL}{sep}url={target_url}"
         try:
             res = requests.get(req_url, headers=HEADERS, timeout=30)
-            if res.status_code == 200:
+            if res.status_code == 200 and is_valid_bandcamp_page(res.text):
+                print(f"    Успех через Cloudflare Worker! Размер: {len(res.text)} байт")
                 return res.text
         except Exception as e:
-            print(f"Ошибка Worker: {e}")
+            print(f"   ⚠️ Ошибка Worker: {e}")
 
-    # 4. Прямой запрос (резервный)
-    print("⚠️ [ВНИМАНИЕ]: Прямой запрос без прокси")
-    try:
-        res = requests.get(target_url, headers=HEADERS, timeout=30)
-        return res.text if res.status_code == 200 else None
-    except Exception as e:
-        print(f"Ошибка прямого запроса: {e}")
-        return None
+    print("❌ Все способы запроса вернули ошибку или заглушку.")
+    return None
 
 def extract_urls_from_json(obj):
     """Рекурсивно извлекает ссылки на релизы из JSON структуры Bandcamp."""
     urls = []
     if isinstance(obj, dict):
         for key, value in obj.items():
-            if key in ("item_url", "tralbum_url", "page_url", "url") and isinstance(value, str):
+            if key in ("item_url", "tralbum_url", "page_url", "url", "band_url") and isinstance(value, str):
                 if "/album/" in value or "/track/" in value:
                     urls.append(value)
             else:
@@ -108,8 +119,6 @@ def get_new_ambient_releases():
     if not html_text:
         print("❌ Не удалось загрузить страницу Bandcamp.")
         return []
-
-    print(f"[Bandcamp Page] Успешно загружено: {len(html_text)} байт")
 
     soup = BeautifulSoup(html_text, "html.parser")
 
