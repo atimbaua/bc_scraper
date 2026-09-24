@@ -1,3 +1,4 @@
+import re
 import os
 import json
 import html
@@ -39,27 +40,36 @@ def get_new_ambient_releases():
     soup = BeautifulSoup(response.text, "html.parser")
     releases = []
 
-    # Находим элементы релизов в каталоге
-    items = soup.select("li.item_list_item, div.discover-item, a.item_link")
-    
-    for item in items:
+    # Способ 1: Парсинг встроенного JSON (data-blob)
+    pagedata = soup.find(id="pagedata")
+    if pagedata and pagedata.get("data-blob"):
         try:
-            link = item.get("href") or item.find("a")["href"]
-            if not link:
-                continue
-            
-            # Приводим ссылку к каноничному виду без query-параметров
+            blob_data = json.loads(pagedata["data-blob"])
+            # Извлекаем элементы из дисковера Bandcamp
+            items = (
+                blob_data.get("hub_data", {}).get("dig_deeper", {}).get("items", []) or
+                blob_data.get("tab_data", {}).get("items", [])
+            )
+            for item in items:
+                link = item.get("tralbum_url") or item.get("item_url")
+                if link:
+                    releases.append(link.split("?")[0])
+        except Exception as e:
+            print(f"Ошибка разбора data-blob: {e}")
+
+    # Способ 2 (Резервный): Сканирование сырого текста страницы с помощью регулярных выражений
+    if not releases:
+        print("Поиск через JSON не дал результатов, задействуем регулярное выражение...")
+        pattern = r'https?://[a-zA-Z0-9-]+\.bandcamp\.com/(?:album|track)/[a-zA-Z0-9_-]+'
+        found_urls = re.findall(pattern, response.text)
+        for link in found_urls:
             clean_link = link.split("?")[0]
-            if not clean_link.startswith("http"):
-                clean_link = f"https:{clean_link}" if clean_link.startswith("//") else f"https://bandcamp.com{clean_link}"
+            releases.append(clean_link)
 
-            if "/album/" in clean_link or "/track/" in clean_link:
-                releases.append(clean_link)
-        except Exception:
-            continue
-
-    # Удаляем дубликаты, сохраняя порядок
-    return list(dict.fromkeys(releases))
+    # Удаление дубликатов с сохранением порядка
+    unique_releases = list(dict.fromkeys(releases))
+    print(f"Найдено релизов на Bandcamp: {len(unique_releases)}")
+    return unique_releases
 
 def fetch_release_details(url):
     """Извлекает детальные метаданные (обложку, описание, исполнителя) со страницы релиза."""
