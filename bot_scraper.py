@@ -2,22 +2,19 @@ import os
 import re
 import json
 import html
-import requests
-import cloudscraper
+import requests  # Для Telegram API
+from curl_cffi import requests as crequests  # Обходит защиту Cloudflare TLS Fingerprint
 from bs4 import BeautifulSoup
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "@bc_ambient")
 POSTED_FILE = "posted_releases.json"
 
-# Создаем скрейпер для обхода защиты Cloudflare
-scraper = cloudscraper.create_scraper(
-    browser={
-        'browser': 'chrome',
-        'platform': 'windows',
-        'desktop': True
-    }
-)
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+}
 
 def load_posted():
     """Загружает список уже опубликованных релизов."""
@@ -37,35 +34,59 @@ def save_posted(posted_set):
 def get_new_ambient_releases():
     """Собирает ссылки на новые Ambient релизы с Bandcamp."""
     releases = []
-
-    # --- Способ 1: Парсинг страницы тега через Cloudscraper ---
+    
+    # 1. Запрос к странице тега ambient через скрейпер с подделкой TLS-отпечатка Chrome
     url = "https://bandcamp.com/tag/ambient?sort_field=date"
     try:
-        res = scraper.get(url, timeout=20)
+        res = crequests.get(url, headers=HEADERS, impersonate="chrome124", timeout=20)
         print(f"[Bandcamp Tag] Статус: {res.status_code}, Размер ответа: {len(res.text)} байт")
 
         if res.status_code == 200 and len(res.text) > 10000:
-            # Разэкранируем слэши (https:\/\/... -> https://...)
-            clean_text = res.text.replace(r'\/', '/')
+            soup = BeautifulSoup(res.text, "html.parser")
+            
+            # Вариант А: Извлечение data-blob JSON
+            pagedata = soup.find(id="pagedata")
+            if pagedata and pagedata.get("data-blob"):
+                try:
+                    blob = json.loads(pagedata["data-blob"])
+                    hub = blob.get("hub_data", {})
+                    dig = hub.get("dig_deeper", {})
+                    items = dig.get("items", []) or blob.get("tab_data", {}).get("items", [])
+                    for item in items:
+                        link = item.get("tralbum_url") or item.get("item_url")
+                        if link:
+                            releases.append(link.split("?")[0])
+                    if releases:
+                        print(f" Извлечено из data-blob: {len(releases)} релизов")
+                except Exception as e:
+                    print(f" Ошибка разбора data-blob: {e}")
 
-            # Ищем все ссылки на альбомы и треки Bandcamp
+            # Вариант Б: Сканирование регулярными выражениями по всему тексту страницы
+            clean_text = res.text.replace(r'\/', '/')
             pattern = r'https://[a-zA-Z0-9\.-]+\.bandcamp\.com/(?:album|track)/[a-zA-Z0-9%_-]+'
             found_urls = re.findall(pattern, clean_text)
-
             for link in found_urls:
                 clean_link = link.split("?")[0]
-                releases.append(clean_link)
-    except Exception as e:
-        print(f"Ошибка при получении страницы Bandcamp: {e}")
+                if not clean_link.startswith("https://bandcamp.com/"):
+                    releases.append(clean_link)
 
-    # --- Способ 2: Запасной запрос к внутреннему API через Cloudscraper ---
+    except Exception as e:
+        print(f" Ошибка при запросе Bandcamp: {e}")
+
+    # Запасной способ: запрос к API с эмуляцией Chrome
     if not releases:
-        print("Сканирование страницы не дало результатов, пробуем API...")
+        print(" Страница пуста, пробуем API...")
         api_url = "https://bandcamp.com/api/hub/2/dig_deeper"
         payload = {"tag": "ambient", "page": 0, "sort": "date"}
         try:
-            res = scraper.post(api_url, json=payload, timeout=20)
-            print(f"[Bandcamp API] Статус: {res.status_code}, Размер: {len(res.text)} байт")
+            res = crequests.post(
+                api_url, 
+                json=payload, 
+                headers={**HEADERS, "Referer": "https://bandcamp.com/tag/ambient"},
+                impersonate="chrome124", 
+                timeout=20
+            )
+            print(f"[API] Статус: {res.status_code}, Размер: {len(res.text)} байт")
             if res.status_code == 200:
                 data = res.json()
                 items = data.get("items", []) or data.get("results", [])
@@ -74,7 +95,7 @@ def get_new_ambient_releases():
                     if link:
                         releases.append(link.split("?")[0])
         except Exception as e:
-            print(f"Ошибка API Bandcamp: {e}")
+            print(f" Ошибка API: {e}")
 
     unique_releases = list(dict.fromkeys(releases))
     print(f"Итого найдено релизов: {len(unique_releases)}")
@@ -83,7 +104,7 @@ def get_new_ambient_releases():
 def fetch_release_details(url):
     """Извлекает обложку, название и описание релиза."""
     try:
-        res = scraper.get(url, timeout=20)
+        res = crequests.get(url, headers=HEADERS, impersonate="chrome124", timeout=20)
         if res.status_code != 200:
             return None
 
@@ -150,7 +171,6 @@ def main():
     release_links = get_new_ambient_releases()
 
     new_posts = 0
-    # Публикуем от более старых к новым
     for link in reversed(release_links):
         if link in posted:
             continue
