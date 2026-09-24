@@ -22,6 +22,7 @@ jobs:
         run: |
           pip install requests beautifulsoup4
           pip install requests beautifulsoup4 cloudscraper
+          pip install requests beautifulsoup4 curl_cffi
 
       - name: Запуск автопостинга
         env:
