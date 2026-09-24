@@ -8,7 +8,7 @@ from bs4 import BeautifulSoup
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "@bc_ambient")
 SCRAPERAPI_KEY = os.getenv("SCRAPERAPI_KEY")
-CLOUDFLARE_WORKER_URL = os.getenv("CLOUDFLARE_WORKER_URL", "")
+CLOUDFLARE_WORKER_URL = os.getenv("CLOUDFLARE_WORKER_URL")
 
 POSTED_FILE = "posted_releases.json"
 
@@ -32,20 +32,23 @@ def save_posted(posted_set):
         json.dump(list(posted_set), f, ensure_ascii=False, indent=2)
 
 def fetch_html(target_url):
-    """Универсально запрашивает любую страницу через ScraperAPI, Worker или напрямую."""
+    """Универсально запрашивает страницу через ScraperAPI, Cloudflare Worker или напрямую."""
     if SCRAPERAPI_KEY:
+        print(" [СПОСОБ ЗАПРОСА]: Используется ScraperAPI")
         req_url = f"http://api.scraperapi.com?api_key={SCRAPERAPI_KEY}&url={target_url}"
     elif CLOUDFLARE_WORKER_URL:
+        print(" [СПОСОБ ЗАПРОСА]: Используется Cloudflare Worker")
         sep = "&" if "?" in CLOUDFLARE_WORKER_URL else "?"
         req_url = f"{CLOUDFLARE_WORKER_URL}{sep}url={target_url}"
     else:
+        print("⚠️ [ВНИМАНИЕ]: Прокси не задан! Запрос идет напрямую с GitHub (высокий риск блокировки Cloudflare)")
         req_url = target_url
 
     try:
         res = requests.get(req_url, headers=HEADERS, timeout=30)
         return res
     except Exception as e:
-        print(f"Ошибка сетевого запроса: {e}")
+        print(f" Ошибка сетевого запроса: {e}")
         return None
 
 def clean_and_unescape(text):
@@ -66,31 +69,37 @@ def get_new_ambient_releases():
 
     print(f"[Bandcamp Page] Статус: {res.status_code}, Размер: {len(res.text)} байт")
 
-    if res.status_code == 200 and len(res.text) > 5000:
+    if res.status_code == 200:
+        if len(res.text) <= 5000:
+            print("❌ Ошибка: Получена заглушка Cloudflare (размер < 5 КБ). Прокси не сработал или не настроен.")
+            return []
+
         clean_text = clean_and_unescape(res.text)
 
-        # Вытаскиваем абсолютно все URL-подобные строки из кода страницы
-        raw_urls = re.findall(r'https?://[^\s"<>\'\\]+', clean_text)
+        # Способ 1: Поиск по открытым тегам <a>
+        soup = BeautifulSoup(clean_text, "html.parser")
+        for a in soup.find_all("a", href=True):
+            href = a["href"]
+            if "/album/" in href or "/track/" in href:
+                clean_url = href.split("?")[0].split("#")[0]
+                if clean_url.startswith("//"):
+                    clean_url = "https:" + clean_url
+                elif clean_url.startswith("/"):
+                    clean_url = "https://bandcamp.com" + clean_url
+                
+                if not clean_url.startswith("https://bandcamp.com/"):
+                    releases.append(clean_url)
 
-        for url in raw_urls:
-            url = url.rstrip('.,;)"\'')
-            # Фильтруем только ссылки на альбомы и треки
-            if '/album/' in url or '/track/' in url:
-                # Очищаем от параметров запроса (?from=...)
+        # Способ 2: Запасной поиск всех URL регулярными выражениями
+        if not releases:
+            raw_urls = re.findall(r'https?://[a-zA-Z0-9\.-]+\.bandcamp\.com/(?:album|track)/[a-zA-Z0-9%_\.-]+', clean_text)
+            for url in raw_urls:
                 clean_url = url.split('?')[0].split('#')[0]
-                # Исключаем служебные страницы самого bandcamp.com
                 if not clean_url.startswith('https://bandcamp.com/'):
                     releases.append(clean_url)
 
     unique_releases = list(dict.fromkeys(releases))
     print(f"Итого найдено релизов: {len(unique_releases)}")
-
-    # Диагностика на случай, если ничего не найдено
-    if not unique_releases and len(res.text) > 0:
-        print("[DEBUG] Диагностика страницы:")
-        print(f"Содержит '/album/': {'/album/' in res.text}")
-        print(f"Содержит '/track/': {'/track/' in res.text}")
-
     return unique_releases
 
 def fetch_release_details(url):
@@ -152,7 +161,7 @@ def send_to_telegram(release):
 
 def main():
     if not TELEGRAM_BOT_TOKEN:
-        print(" Ошибка: Не задан TELEGRAM_BOT_TOKEN")
+        print("Ошибка: Не задан TELEGRAM_BOT_TOKEN")
         return
 
     posted = load_posted()
