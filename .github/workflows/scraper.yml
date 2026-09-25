@@ -2,8 +2,9 @@ name: Bandcamp Ambient Bot Parser
 
 on:
   schedule:
-    - cron: '0 */2 * * *'  # Запуск каждые 2 часа
-  workflow_dispatch:       # Возможность запуска вручную кнопкой
+    # Запуск каждые 4 часа (в 00:00, 04:00, 08:00, 12:00, 16:00, 20:00 по UTC)
+    - cron: '0 */4 * * *'
+  workflow_dispatch: # Оставляем кнопку для ручной проверки при необходимости
 
 jobs:
   build-and-run:
@@ -20,8 +21,6 @@ jobs:
 
       - name: Установка зависимостей
         run: |
-          pip install requests beautifulsoup4
-          pip install requests beautifulsoup4 cloudscraper
           pip install requests beautifulsoup4 curl_cffi
 
       - name: Запуск автопостинга
