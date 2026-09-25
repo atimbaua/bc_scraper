@@ -2,6 +2,7 @@ import os
 import re
 import json
 import html
+import time  # Добавлен импорт времени для задержек
 import requests
 from bs4 import BeautifulSoup
 
@@ -207,6 +208,9 @@ def send_to_telegram(release):
     resp = requests.post(api_url, data=payload, timeout=20)
     return resp.ok
 
+# Лимит публикаций за один запуск (чтобы не заспамить канал)
+MAX_POSTS_PER_RUN = 3
+
 def main():
     if not TELEGRAM_BOT_TOKEN:
         print("Ошибка: Не задан TELEGRAM_BOT_TOKEN")
@@ -216,7 +220,13 @@ def main():
     release_links = get_new_ambient_releases()
 
     new_posts = 0
+    # Идем от старых к новым
     for link in reversed(release_links):
+        # Если достигли лимита за этот запуск — останавливаемся
+        if new_posts >= MAX_POSTS_PER_RUN:
+            print(f" Достигнут лимит в {MAX_POSTS_PER_RUN} постов за запуск. Остановка.")
+            break
+
         if link in posted:
             continue
 
@@ -228,6 +238,8 @@ def main():
         if send_to_telegram(details):
             posted.add(link)
             new_posts += 1
+            # Пауза 3 секунды между постами, чтобы Telegram не заблокировал за спам
+            time.sleep(3)
         else:
             print(f"Не удалось отправить в Telegram: {link}")
 
