@@ -15,8 +15,8 @@ except ImportError:
 # ==============================================================================
 # НАСТРОЙКИ (Изменяйте жанр и параметризацию здесь)
 # ==============================================================================
-GENRE = "techno"          # Жанр Bandcamp (например: ambient, post-rock, dungeon-synth, synthwave)
-MAX_POSTS_PER_RUN = 3       # Лимит публикаций за один запуск
+GENRE = "ambient"          # Жанр Bandcamp (например: ambient, post-rock, dungeon-synth, synthwave)
+MAX_POSTS_PER_RUN = 5       # Лимит публикаций за один запуск
 POSTED_FILE = "posted_releases.json"
 CSV_FILE = "releases_data.csv"
 
