@@ -2,7 +2,8 @@ name: Bandcamp Ambient Bot Parser
 
 on:
   schedule:
-    - cron: '0 */4 * * *'  # Запуск каждые 4 часа
+    # Запуск каждый час на 0-й минуте (например, 12:00, 13:00, 14:00 UTC)
+    - cron: '0 * * * *'
   workflow_dispatch:       # Возможность запуска вручную
 
 jobs:
