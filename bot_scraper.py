@@ -157,7 +157,7 @@ def parse_item_details(item):
     if not isinstance(item, dict):
         return None
 
-    # Ссылка
+    # 1. Извлечение первичной ссылки
     link = (
         item.get("tralbum_url")
         or item.get("item_url")
@@ -166,27 +166,36 @@ def parse_item_details(item):
         or item.get("link")
     )
 
+    # Если готового URL нет, собираем из url_hints
     if not link and isinstance(item.get("url_hints"), dict):
         hints = item["url_hints"]
         subdomain = hints.get("subdomain")
         slug = hints.get("slug")
-        item_type = hints.get("item_type") or ("album" if hints.get("type") == "a" or item.get("type") == "a" else "track")
+        raw_type = hints.get("item_type") or hints.get("type") or item.get("type")
+        item_type = "album" if raw_type == "a" else ("track" if raw_type == "t" else raw_type or "album")
         if subdomain and slug:
             link = f"https://{subdomain}.bandcamp.com/{item_type}/{slug}"
 
+    # Если прямого URL нет, собираем из полей subdomain и slug
     if not link and item.get("subdomain") and item.get("slug"):
         subdomain = item["subdomain"]
         slug = item["slug"]
-        item_type = "album" if item.get("type") == "a" else "track"
+        raw_type = item.get("type")
+        item_type = "album" if raw_type == "a" else ("track" if raw_type == "t" else "album")
         link = f"https://{subdomain}.bandcamp.com/{item_type}/{slug}"
-
-    if link and link.startswith("//"):
-        link = "https:" + link
 
     if not link:
         return None
 
-    # Артист
+    # 2. Нормализация формата ссылки
+    if link.startswith("//"):
+        link = "https:" + link
+
+    # Заменяем короткие алиасы Bandcamp на полные путевые имена
+    link = link.replace(".bandcamp.com/a/", ".bandcamp.com/album/")
+    link = link.replace(".bandcamp.com/t/", ".bandcamp.com/track/")
+
+    # 3. Исполнитель (artist)
     artist = (
         item.get("band_name")
         or item.get("artist")
@@ -197,7 +206,7 @@ def parse_item_details(item):
     if isinstance(artist, str) and artist.startswith("by "):
         artist = artist[3:]
 
-    # Название
+    # 4. Название релиза (title)
     title = (
         item.get("title")
         or item.get("album_title")
@@ -207,7 +216,7 @@ def parse_item_details(item):
 
     title_full = f"{title} by {artist}"
 
-    # Картинка
+    # 5. Обложка (art_id)
     art_id = item.get("art_id") or item.get("primary_art_id") or item.get("image_id")
     image_url = f"https://f4.bcbits.com/img/a{art_id}_10.jpg" if art_id else ""
 
