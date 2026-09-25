@@ -40,7 +40,7 @@
 | Переменная | Описание | Обязательна? |
 | :--- | :--- | :---: |
 | `TELEGRAM_BOT_TOKEN` | Токен Telegram-бота, полученный у [@BotFather](https://t.me/BotFather) | **Да** |
-| `TELEGRAM_CHAT_ID` | Имя канала (например, `@bc_ambient`) или его ID | **Да** |
+| `TELEGRAM_CHAT_ID` | Имя канала или его ID | **Да** |
 | `SCRAPERAPI_KEY` | API-ключ сервиса [ScraperAPI](https://www.scraperapi.com/) (резервный канал) | Нет |
 
 ---
