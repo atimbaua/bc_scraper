@@ -30,9 +30,9 @@ jobs:
           SCRAPERAPI_KEY: ${{ secrets.SCRAPERAPI_KEY }}
         run: python bot_scraper.py
 
-      - name: Сохранение истории опубликованного
+      - name: Сохранение истории опубликованного и метрик
         run: |
           git config --global user.name 'github-actions[bot]'
           git config --global user.email 'github-actions[bot]@users.noreply.github.com'
-          git add posted_releases.json
-          git diff --quiet && git diff --staged --quiet || (git commit -m "Update posted releases" && git push)
+          git add posted_releases.json releases_data.csv
+          git diff --quiet && git diff --staged --quiet || (git commit -m "Update posted releases and CSV analytics" && git push)
