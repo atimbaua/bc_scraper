@@ -18,7 +18,7 @@ SCRAPERAPI_KEY = os.getenv("SCRAPERAPI_KEY")
 
 POSTED_FILE = "posted_releases.json"
 CSV_FILE = "releases_data.csv"
-MAX_POSTS_PER_RUN = 3
+MAX_POSTS_PER_RUN = 5
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
