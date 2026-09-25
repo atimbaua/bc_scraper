@@ -17,7 +17,6 @@ except ImportError:
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "@bc_ambient")
 SCRAPERAPI_KEY = os.getenv("SCRAPERAPI_KEY")
-CLOUDFLARE_WORKER_URL = os.getenv("CLOUDFLARE_WORKER_URL")
 
 POSTED_FILE = "posted_releases.json"
 CSV_FILE = "releases_data.csv"
@@ -25,8 +24,10 @@ MAX_POSTS_PER_RUN = 3
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept": "application/json, text/javascript, */*; q=0.01",
     "Accept-Language": "en-US,en;q=0.9",
+    "Content-Type": "application/json",
+    "X-Requested-With": "XMLHttpRequest"
 }
 
 def init_csv_file():
@@ -58,7 +59,7 @@ def save_to_csv(details):
         album_title, artist = full_title.rsplit(" by ", 1)
     else:
         album_title = full_title
-        artist = "Неизвестен"
+        artist = details.get("artist", "Неизвестен")
 
     published_at = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
     tags_str = ", ".join(details.get("tags", []))
@@ -74,159 +75,97 @@ def save_to_csv(details):
             details.get("image", "")
         ])
 
-def is_valid_bandcamp_page(text):
-    if not text:
-        return False
-    return len(text) > 10000 and ("data-blob" in text or "bandcamp" in text.lower())
+def fetch_from_bandcamp_api():
+    """Получает свежие ambient релизы через внутреннее JSON API Bandcamp."""
+    api_url = "https://bandcamp.com/api/hub/2/dig_deeper"
+    payload = {
+        "filters": {
+            "format": "all",
+            "location": 0,
+            "sort": "date",
+            "tags": ["ambient"]
+        },
+        "page": 1
+    }
 
-def fetch_html(target_url):
-    """
-    Каскадный запрос с рендерингом JavaScript для Bandcamp.
-    """
     # 1. Попытка через curl_cffi
     if CURL_CFFI_AVAILABLE:
-        print(" [СПОСОБ 1]: Пробуем curl_cffi...")
+        print(" [API 1]: Пробуем curl_cffi POST...")
         try:
-            res = curl_requests.get(target_url, headers=HEADERS, impersonate="chrome120", timeout=30)
-            if res.status_code == 200 and is_valid_bandcamp_page(res.text):
-                print(f"    Успех curl_cffi! Размер: {len(res.text)} байт")
-                return res.text
-            print(f"   ⚠️ curl_cffi: Код {res.status_code}, размер {len(res.text) if res.text else 0} байт")
+            res = curl_requests.post(api_url, json=payload, headers=HEADERS, impersonate="chrome120", timeout=30)
+            if res.status_code == 200 and "items" in res.text:
+                data = res.json()
+                items = data.get("items", [])
+                print(f"    Успех API curl_cffi! Получено релизов: {len(items)}")
+                return items
+            print(f"   ⚠️ curl_cffi API: Код {res.status_code}, размер {len(res.text)} байт")
         except Exception as e:
-            print(f"   ⚠️ Ошибка curl_cffi: {e}")
+            print(f"   ⚠️ Ошибка API curl_cffi: {e}")
 
-    # 2. Попытка через ScraperAPI (с render=true для выполнения JS на странице)
+    # 2. Попытка через ScraperAPI
     if SCRAPERAPI_KEY:
-        print(" [СПОСОБ 2]: Пробуем ScraperAPI (с рендерингом JS)...")
-        req_url = f"http://api.scraperapi.com?api_key={SCRAPERAPI_KEY}&url={target_url}&render=true"
+        print(" [API 2]: Пробуем ScraperAPI POST...")
+        scraper_url = f"http://api.scraperapi.com?api_key={SCRAPERAPI_KEY}&url={api_url}"
         try:
-            res = requests.get(req_url, headers=HEADERS, timeout=60)
-            if res.status_code == 200 and is_valid_bandcamp_page(res.text):
-                print(f"    Успех ScraperAPI! Размер: {len(res.text)} байт")
-                return res.text
-            print(f"   ⚠️ ScraperAPI: Код {res.status_code}, размер {len(res.text) if res.text else 0} байт")
+            res = requests.post(scraper_url, json=payload, headers={"Content-Type": "application/json"}, timeout=40)
+            if res.status_code == 200 and "items" in res.text:
+                data = res.json()
+                items = data.get("items", [])
+                print(f"    Успех API ScraperAPI! Получено релизов: {len(items)}")
+                return items
+            print(f"   ⚠️ ScraperAPI API: Код {res.status_code}, размер {len(res.text)} байт")
         except Exception as e:
-            print(f"   ⚠️ Ошибка ScraperAPI: {e}")
+            print(f"   ⚠️ Ошибка API ScraperAPI: {e}")
 
-    # 3. Прямой запрос (Fallback)
-    print(" [СПОСОБ 3]: Прямой запрос requests...")
+    # 3. Прямой запрос
+    print(" [API 3]: Прямой POST запрос...")
     try:
-        res = requests.get(target_url, headers=HEADERS, timeout=20)
-        if res.status_code == 200 and is_valid_bandcamp_page(res.text):
-            print(f"    Успех прямой запрос! Размер: {len(res.text)} байт")
-            return res.text
-        print(f"   ⚠️ Прямой запрос: Код {res.status_code}, размер {len(res.text) if res.text else 0} байт")
+        res = requests.post(api_url, json=payload, headers=HEADERS, timeout=20)
+        if res.status_code == 200 and "items" in res.text:
+            data = res.json()
+            items = data.get("items", [])
+            print(f"    Успех прямого API! Получено релизов: {len(items)}")
+            return items
+        print(f"   ⚠️ Прямой API запрос: Код {res.status_code}, размер {len(res.text)} байт")
     except Exception as e:
-        print(f"   ⚠️ Ошибка прямого запроса: {e}")
+        print(f"   ⚠️ Ошибка прямого API запроса: {e}")
 
-    return None
-    
-def extract_urls_from_json(obj):
-    urls = []
-    if isinstance(obj, dict):
-        for key, value in obj.items():
-            if key in ("item_url", "tralbum_url", "page_url", "url", "band_url") and isinstance(value, str):
-                if "/album/" in value or "/track/" in value:
-                    urls.append(value)
-            else:
-                urls.extend(extract_urls_from_json(value))
-    elif isinstance(obj, list):
-        for item in obj:
-            urls.extend(extract_urls_from_json(item))
-    return urls
+    return []
 
-def get_new_ambient_releases():
-    target_url = "https://bandcamp.com/tag/ambient?sort_field=date"
-    html_text = fetch_html(target_url)
-    if not html_text:
-        print("❌ Не удалось загрузить страницу Bandcamp ни одним из способов.")
-        return []
-
-    soup = BeautifulSoup(html_text, "html.parser")
-    raw_releases = []
-
-    # 1. Поиск через data-blob (JSON)
-    pagedata = soup.find(attrs={"data-blob": True})
-    if pagedata and pagedata.get("data-blob"):
-        try:
-            blob_data = json.loads(pagedata["data-blob"])
-            json_urls = extract_urls_from_json(blob_data)
-            raw_releases.extend(json_urls)
-            print(f"   [data-blob]: Найдено потенциальных ссылок: {len(json_urls)}")
-        except Exception as e:
-            print(f"⚠️ Ошибка разбора data-blob: {e}")
-
-    # 2. Поиск через теги <a> с помощью BeautifulSoup
-    anchor_urls = []
-    for a in soup.find_all("a", href=True):
-        href = a["href"]
-        if "/album/" in href or "/track/" in href:
-            anchor_urls.append(href)
-    raw_releases.extend(anchor_urls)
-    print(f"   [BS4 <a> tags]: Найдено потенциальных ссылок: {len(anchor_urls)}")
-
-    # 3. Поиск регулярным выражением по всему тексту
-    clean_text = html.unescape(html_text).replace(r'\/', '/').replace(r'\\/', '/')
-    pattern = r'(?:https?:)?//[a-zA-Z0-9.-]+\.bandcamp\.com/(?:album|track)/[^\s"\'<>\\?#]+'
-    regex_urls = re.findall(pattern, clean_text)
-    raw_releases.extend(regex_urls)
-    print(f"   [Regex]: Найдено потенциальных ссылок: {len(regex_urls)}")
-
-    # 4. Нормализация и фильтрация ссылок
-    cleaned_releases = []
-    for url in raw_releases:
-        # Добавляем https: если ссылка началась с //
-        if url.startswith("//"):
-            url = "https:" + url
-
-        # Чистим параметры query и якори
-        clean_url = url.split("?")[0].split("#")[0].rstrip('.,;)"\'')
-
-        # Исключаем служебные ссылки вида https://bandcamp.com/album/... (нам нужны поддомены артистов)
-        if (
-            clean_url.startswith("https://")
-            and ".bandcamp.com/" in clean_url
-            and not clean_url.startswith("https://bandcamp.com/")
-            and not clean_url.startswith("http://bandcamp.com/")
-        ):
-            cleaned_releases.append(clean_url)
-
-    unique_releases = list(dict.fromkeys(cleaned_releases))
-    print(f"🔎 Итого уникальных валидных релизов: {len(unique_releases)}")
-    return unique_releases
-
-def fetch_release_details(url):
-    html_text = fetch_html(url)
-    if not html_text:
+def parse_item_details(item):
+    """Преобразует объект релиза из API в стандартный формат бота."""
+    link = item.get("tralbum_url") or item.get("item_url")
+    if not link:
         return None
 
-    soup = BeautifulSoup(html_text, "html.parser")
+    artist = item.get("band_name", "Неизвестный исполнитель")
+    title = item.get("title", "Ambient Release")
+    title_full = f"{title} by {artist}"
 
-    og_title = soup.find("meta", property="og:title")
-    og_image = soup.find("meta", property="og:image")
-    og_desc = soup.find("meta", property="og:description")
+    # Формируем прямую ссылку на обложку высокими качеством по art_id
+    art_id = item.get("art_id")
+    image_url = f"https://f4.bcbits.com/img/a{art_id}_10.jpg" if art_id else ""
 
-    title_full = og_title["content"] if og_title else "Ambient Release"
-    image_url = og_image["content"] if og_image else ""
-    description = og_desc["content"] if og_desc else ""
-
-    tags = [t.get_text(strip=True) for t in soup.select("a.tag")]
+    genre = item.get("genre_text", "ambient")
+    tags = ["ambient"]
+    if genre and genre.lower() != "ambient":
+        tags.append(genre.lower())
 
     return {
         "title_full": title_full,
+        "artist": artist,
+        "album_title": title,
         "image": image_url,
-        "description": description,
-        "tags": tags[:6],
-        "link": url
+        "description": f"New ambient release from {artist}.",
+        "tags": tags,
+        "link": link
     }
 
 def send_to_telegram(release):
     api_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
 
     title = html.escape(release["title_full"])
-    desc = html.escape(release["description"][:300])
-    if len(release["description"]) > 300:
-        desc += "..."
+    desc = html.escape(release["description"])
 
     tags_list = [f"#{t.lower().replace('-', '_').replace(' ', '_')}" for t in release["tags"]]
     if "#ambient" not in tags_list:
@@ -256,43 +195,46 @@ def main():
         return
 
     init_csv_file()
-
     posted = load_posted()
-    release_links = get_new_ambient_releases()
 
-    if not release_links:
-        print("ℹ️ Ссылок на релизы не обнаружено.")
+    raw_items = fetch_from_bandcamp_api()
+    if not raw_items:
+        print("❌ Не удалось получить список релизов через Bandcamp API.")
         return
 
-    # Считаем, сколько из найденных релизов уже было в базе
-    already_posted_count = sum(1 for link in release_links if link in posted)
-    new_to_process = [link for link in release_links if link not in posted]
+    # Собираем валидные объекты релизов
+    releases = []
+    for item in raw_items:
+        details = parse_item_details(item)
+        if details and details["link"]:
+            releases.append(details)
 
-    print(f"📊 Уже опубликовано ранее: {already_posted_count}")
-    print(f"✨ Новых релизов для публикации: {len(new_to_process)}")
+    print(f"🔎 Успешно распознано релизов из API: {len(releases)}")
+
+    # Фильтруем те, что уже публиковали
+    already_posted = [r for r in releases if r["link"] in posted]
+    new_releases = [r for r in releases if r["link"] not in posted]
+
+    print(f"📊 Ранее опубликовано: {len(already_posted)}")
+    print(f"✨ Новых релизов для публикации: {len(new_releases)}")
 
     new_posts = 0
-    for link in reversed(new_to_process):
+    for release in reversed(new_releases):
         if new_posts >= MAX_POSTS_PER_RUN:
-            print(f"Достигнут лимит в {MAX_POSTS_PER_RUN} постов за запуск. Остановка.")
+            print(f"🛑 Достигнут лимит в {MAX_POSTS_PER_RUN} постов за запуск. Остановка.")
             break
 
-        details = fetch_release_details(link)
-        if not details or not details["image"]:
-            continue
-
-        print(f"🚀 Публикация: {details['title_full']}")
-        if send_to_telegram(details):
-            posted.add(link)
-            save_to_csv(details)
+        print(f"🚀 Публикация: {release['title_full']}")
+        if send_to_telegram(release):
+            posted.add(release["link"])
+            save_to_csv(release)
             new_posts += 1
             time.sleep(3)
         else:
-            print(f"❌ Не удалось отправить в Telegram: {link}")
+            print(f"❌ Не удалось отправить в Telegram: {release['link']}")
 
     save_posted(posted)
     print(f"🏁 Завершено. Опубликовано новых релизов: {new_posts}")
-    print(f"Завершено. Опубликовано новых релизов: {new_posts}")
 
 if __name__ == "__main__":
     main()
