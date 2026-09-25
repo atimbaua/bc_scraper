@@ -81,7 +81,7 @@ def is_valid_bandcamp_page(text):
 
 def fetch_html(target_url):
     """
-    Каскадный запрос с подробным логом каждой попытки.
+    Каскадный запрос с рендерингом JavaScript для Bandcamp.
     """
     # 1. Попытка через curl_cffi
     if CURL_CFFI_AVAILABLE:
@@ -95,12 +95,12 @@ def fetch_html(target_url):
         except Exception as e:
             print(f"   ⚠️ Ошибка curl_cffi: {e}")
 
-    # 2. Попытка через ScraperAPI (обычный запрос без render=true для экономии лимитов)
+    # 2. Попытка через ScraperAPI (с render=true для выполнения JS на странице)
     if SCRAPERAPI_KEY:
-        print(" [СПОСОБ 2]: Пробуем ScraperAPI...")
-        req_url = f"http://api.scraperapi.com?api_key={SCRAPERAPI_KEY}&url={target_url}"
+        print(" [СПОСОБ 2]: Пробуем ScraperAPI (с рендерингом JS)...")
+        req_url = f"http://api.scraperapi.com?api_key={SCRAPERAPI_KEY}&url={target_url}&render=true"
         try:
-            res = requests.get(req_url, headers=HEADERS, timeout=40)
+            res = requests.get(req_url, headers=HEADERS, timeout=60)
             if res.status_code == 200 and is_valid_bandcamp_page(res.text):
                 print(f"    Успех ScraperAPI! Размер: {len(res.text)} байт")
                 return res.text
@@ -108,7 +108,7 @@ def fetch_html(target_url):
         except Exception as e:
             print(f"   ⚠️ Ошибка ScraperAPI: {e}")
 
-    # 3. Попытка прямой запрос (Fallback)
+    # 3. Прямой запрос (Fallback)
     print(" [СПОСОБ 3]: Прямой запрос requests...")
     try:
         res = requests.get(target_url, headers=HEADERS, timeout=20)
@@ -120,7 +120,7 @@ def fetch_html(target_url):
         print(f"   ⚠️ Ошибка прямого запроса: {e}")
 
     return None
-
+    
 def extract_urls_from_json(obj):
     urls = []
     if isinstance(obj, dict):
