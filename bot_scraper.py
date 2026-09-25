@@ -13,10 +13,10 @@ except ImportError:
     CURL_CFFI_AVAILABLE = False
 
 # ==============================================================================
-# НАСТРОЙКИ (Изменяйте жанр и параметризацию здесь)
+# НАСТРОЙКИ
 # ==============================================================================
-GENRE = "ambient"          # Жанр Bandcamp (например: ambient, post-rock, dungeon-synth, synthwave)
-MAX_POSTS_PER_RUN = 5       # Лимит публикаций за один запуск
+GENRE = "ambient"          # Изменяйте жанр здесь (ambient, post-rock, techno и т.д.)
+MAX_POSTS_PER_RUN = 3       # Лимит постов за 1 запуск
 POSTED_FILE = "posted_releases.json"
 CSV_FILE = "releases_data.csv"
 
@@ -25,7 +25,6 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "@bc_ambient")
 SCRAPERAPI_KEY = os.getenv("SCRAPERAPI_KEY")
 
 def get_headers():
-    """Динамическое формирование заголовков под выбранный жанр."""
     return {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         "Accept": "application/json, text/javascript, */*; q=0.01",
@@ -37,17 +36,24 @@ def get_headers():
     }
 
 # ==============================================================================
-# РАБОТА С ДАННЫМИ (CSV & JSON)
+# РАБОТА С ССЫЛКАМИ И ФАЙЛАМИ (JSON & CSV)
 # ==============================================================================
 def init_csv_file():
-    """Гарантирует существование CSV-файла с заголовками при запуске."""
+    """Создает CSV файл с точным набором указанных колонок."""
     if not os.path.exists(CSV_FILE):
         with open(CSV_FILE, mode="w", encoding="utf-8", newline="") as f:
             writer = csv.writer(f)
-            writer.writerow(["published_at_utc", "genre", "artist", "album_title", "url", "tags", "image_url"])
+            writer.writerow([
+                "published_at_utc",
+                "genre",
+                "artist",
+                "album_title",
+                "url",
+                "tags",
+                "image_url"
+            ])
 
 def load_posted():
-    """Загружает список уже опубликованных релизов."""
     if os.path.exists(POSTED_FILE):
         try:
             with open(POSTED_FILE, "r", encoding="utf-8") as f:
@@ -57,39 +63,35 @@ def load_posted():
     return set()
 
 def save_posted(posted_set):
-    """Сохраняет обновленный список опубликованных релизов."""
     with open(POSTED_FILE, "w", encoding="utf-8") as f:
         json.dump(list(posted_set), f, ensure_ascii=False, indent=2)
 
 def save_to_csv(details):
-    """Добавляет информацию о релизе строкой в CSV-файл."""
-    full_title = details.get("title_full", "")
-    if " by " in full_title:
-        album_title, artist = full_title.rsplit(" by ", 1)
-    else:
-        album_title = full_title
-        artist = details.get("artist", "Неизвестен")
-
-    published_at = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-    tags_str = ", ".join(details.get("tags", []))
+    """Сохраняет релиз строго по нужным колонкам."""
+    published_at_utc = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    genre = GENRE
+    artist = details.get("artist", "Неизвестный артист").strip()
+    album_title = details.get("album_title", "Без названия").strip()
+    url = details.get("link", "").strip()
+    tags = ", ".join(details.get("tags", []))
+    image_url = details.get("image", "").strip()
 
     with open(CSV_FILE, mode="a", encoding="utf-8", newline="") as f:
         writer = csv.writer(f)
         writer.writerow([
-            published_at,
-            GENRE,
-            artist.strip(),
-            album_title.strip(),
-            details.get("link", ""),
-            tags_str,
-            details.get("image", "")
+            published_at_utc,
+            genre,
+            artist,
+            album_title,
+            url,
+            tags,
+            image_url
         ])
 
 # ==============================================================================
 # ПАРСИНГ API BANDCAMP
 # ==============================================================================
 def fetch_from_discover_api():
-    """Способ 1: Публичное GET API Discover Bandcamp."""
     url = f"https://bandcamp.com/api/discover/3/get_web?g={GENRE}&s=date&p=0"
     headers = get_headers()
     print(f" [МЕТОД 1]: Пробуем GET Discover API ({GENRE})...")
@@ -123,7 +125,6 @@ def fetch_from_discover_api():
     return []
 
 def fetch_from_hub_api():
-    """Способ 2: Внутреннее POST API Dig Deeper."""
     url = "https://bandcamp.com/api/hub/2/dig_deeper"
     headers = get_headers()
     payload = {
@@ -153,11 +154,10 @@ def fetch_from_hub_api():
     return []
 
 def parse_item_details(item):
-    """Гибкий парсинг объекта релиза из любых версий Bandcamp API."""
     if not isinstance(item, dict):
         return None
 
-    # 1. Извлечение или сборка ссылки (link)
+    # Ссылка
     link = (
         item.get("tralbum_url")
         or item.get("item_url")
@@ -186,7 +186,7 @@ def parse_item_details(item):
     if not link:
         return None
 
-    # 2. Исполнитель (artist)
+    # Артист
     artist = (
         item.get("band_name")
         or item.get("artist")
@@ -197,7 +197,7 @@ def parse_item_details(item):
     if isinstance(artist, str) and artist.startswith("by "):
         artist = artist[3:]
 
-    # 3. Название релиза (title)
+    # Название
     title = (
         item.get("title")
         or item.get("album_title")
@@ -207,7 +207,7 @@ def parse_item_details(item):
 
     title_full = f"{title} by {artist}"
 
-    # 4. Обложка (art_id)
+    # Картинка
     art_id = item.get("art_id") or item.get("primary_art_id") or item.get("image_id")
     image_url = f"https://f4.bcbits.com/img/a{art_id}_10.jpg" if art_id else ""
 
@@ -235,7 +235,6 @@ def send_to_telegram(release):
     title = html.escape(release["title_full"])
     desc = html.escape(release["description"])
 
-    # Преобразование тегов в хэштеги (замена пробелов и дефисов на подчёркивания)
     tags_list = [f"#{t.lower().replace('-', '_').replace(' ', '_')}" for t in release["tags"]]
     main_hashtag = f"#{GENRE.lower().replace('-', '_').replace(' ', '_')}"
 
@@ -261,7 +260,7 @@ def send_to_telegram(release):
     return resp.ok
 
 # ==============================================================================
-# ГЛАВНЫЙ ЦИКЛ (MAIN)
+# MAIN
 # ==============================================================================
 def main():
     if not TELEGRAM_BOT_TOKEN:
