@@ -79,7 +79,7 @@ def fetch_from_discover_api():
     """Способ 1: Публичное GET API Discover Bandcamp."""
     url = "https://bandcamp.com/api/discover/3/get_web?g=ambient&s=date&p=0"
     print(" [МЕТОД 1]: Пробуем GET Discover API...")
-    
+
     if CURL_CFFI_AVAILABLE:
         try:
             res = curl_requests.get(url, headers=HEADERS, impersonate="chrome120", timeout=30)
@@ -89,7 +89,7 @@ def fetch_from_discover_api():
                 if items:
                     print(f"    Успех Discover API (curl_cffi)! Найдено релизов: {len(items)}")
                     return items
-            print(f"   ⚠️ Discover API (curl_cffi): Код {res.status_code}, Ответ: {res.text[:100]}")
+            print(f"   ⚠️ Discover API (curl_cffi): Код {res.status_code}")
         except Exception as e:
             print(f"   ⚠️ Ошибка Discover API (curl_cffi): {e}")
 
@@ -131,23 +131,71 @@ def fetch_from_hub_api():
                 if items:
                     print(f"    Успех Dig Deeper API (curl_cffi)! Найдено релизов: {len(items)}")
                     return items
-            print(f"   ⚠️ Dig Deeper API (curl_cffi): Код {res.status_code}, Ответ: {res.text[:100]}")
+            print(f"   ⚠️ Dig Deeper API (curl_cffi): Код {res.status_code}")
         except Exception as e:
             print(f"   ⚠️ Ошибка Dig Deeper API (curl_cffi): {e}")
 
     return []
 
 def parse_item_details(item):
-    """Преобразует объект релиза из API в структуру данных бота."""
-    link = item.get("tralbum_url") or item.get("item_url") or item.get("page_url")
+    """Гибкий парсинг объекта релиза из любых версий Bandcamp API."""
+    if not isinstance(item, dict):
+        return None
+
+    # 1. Извлечение или сборка ссылки (link)
+    link = (
+        item.get("tralbum_url")
+        or item.get("item_url")
+        or item.get("page_url")
+        or item.get("url")
+        or item.get("link")
+    )
+
+    # Если готового URL нет, собираем из url_hints
+    if not link and isinstance(item.get("url_hints"), dict):
+        hints = item["url_hints"]
+        subdomain = hints.get("subdomain")
+        slug = hints.get("slug")
+        item_type = hints.get("item_type") or ("album" if hints.get("type") == "a" or item.get("type") == "a" else "track")
+        if subdomain and slug:
+            link = f"https://{subdomain}.bandcamp.com/{item_type}/{slug}"
+
+    # Если прямого URL нет, собираем из полей subdomain и slug
+    if not link and item.get("subdomain") and item.get("slug"):
+        subdomain = item["subdomain"]
+        slug = item["slug"]
+        item_type = "album" if item.get("type") == "a" else "track"
+        link = f"https://{subdomain}.bandcamp.com/{item_type}/{slug}"
+
+    if link and link.startswith("//"):
+        link = "https:" + link
+
     if not link:
         return None
 
-    artist = item.get("band_name") or item.get("artist") or "Неизвестный исполнитель"
-    title = item.get("title") or item.get("album_title") or "Ambient Release"
+    # 2. Исполнитель (artist)
+    artist = (
+        item.get("band_name")
+        or item.get("artist")
+        or item.get("artist_name")
+        or item.get("secondary_text")
+        or "Неизвестный исполнитель"
+    )
+    if isinstance(artist, str) and artist.startswith("by "):
+        artist = artist[3:]
+
+    # 3. Название релиза (title)
+    title = (
+        item.get("title")
+        or item.get("album_title")
+        or item.get("primary_text")
+        or "Ambient Release"
+    )
+
     title_full = f"{title} by {artist}"
 
-    art_id = item.get("art_id") or item.get("primary_art_id")
+    # 4. Обложка (art_id)
+    art_id = item.get("art_id") or item.get("primary_art_id") or item.get("image_id")
     image_url = f"https://f4.bcbits.com/img/a{art_id}_10.jpg" if art_id else ""
 
     genre = item.get("genre_text", "ambient")
@@ -201,7 +249,6 @@ def main():
     init_csv_file()
     posted = load_posted()
 
-    # Сначала пробуем GET Discover API, если пусто — пробуем POST Dig Deeper API
     raw_items = fetch_from_discover_api()
     if not raw_items:
         raw_items = fetch_from_hub_api()
@@ -215,6 +262,12 @@ def main():
         details = parse_item_details(item)
         if details and details["link"]:
             releases.append(details)
+
+    if raw_items and len(releases) == 0:
+        print("⚠️ Не удалось разобрать элементы. Ключи первого элемента:")
+        if isinstance(raw_items[0], dict):
+            print(list(raw_items[0].keys()))
+            print("Пример объекта:", json.dumps(raw_items[0], ensure_ascii=False)[:300])
 
     print(f"🔎 Успешно распознано релизов из API: {len(releases)}")
 
