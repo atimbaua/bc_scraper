@@ -143,30 +143,56 @@ def get_new_ambient_releases():
         return []
 
     soup = BeautifulSoup(html_text, "html.parser")
-    releases = []
+    raw_releases = []
 
+    # 1. Поиск через data-blob (JSON)
     pagedata = soup.find(attrs={"data-blob": True})
     if pagedata and pagedata.get("data-blob"):
         try:
             blob_data = json.loads(pagedata["data-blob"])
             json_urls = extract_urls_from_json(blob_data)
-            releases.extend(json_urls)
+            raw_releases.extend(json_urls)
+            print(f"   [data-blob]: Найдено потенциальных ссылок: {len(json_urls)}")
         except Exception as e:
-            print(f"Ошибка разбора data-blob: {e}")
+            print(f"⚠️ Ошибка разбора data-blob: {e}")
 
+    # 2. Поиск через теги <a> с помощью BeautifulSoup
+    anchor_urls = []
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        if "/album/" in href or "/track/" in href:
+            anchor_urls.append(href)
+    raw_releases.extend(anchor_urls)
+    print(f"   [BS4 <a> tags]: Найдено потенциальных ссылок: {len(anchor_urls)}")
+
+    # 3. Поиск регулярным выражением по всему тексту
     clean_text = html.unescape(html_text).replace(r'\/', '/').replace(r'\\/', '/')
-    pattern = r'https?://[a-zA-Z0-9.-]+\.bandcamp\.com/(?:album|track)/[^\s"\'<>\\?#]+'
-    found_urls = re.findall(pattern, clean_text)
-    releases.extend(found_urls)
+    pattern = r'(?:https?:)?//[a-zA-Z0-9.-]+\.bandcamp\.com/(?:album|track)/[^\s"\'<>\\?#]+'
+    regex_urls = re.findall(pattern, clean_text)
+    raw_releases.extend(regex_urls)
+    print(f"   [Regex]: Найдено потенциальных ссылок: {len(regex_urls)}")
 
+    # 4. Нормализация и фильтрация ссылок
     cleaned_releases = []
-    for url in releases:
+    for url in raw_releases:
+        # Добавляем https: если ссылка началась с //
+        if url.startswith("//"):
+            url = "https:" + url
+
+        # Чистим параметры query и якори
         clean_url = url.split("?")[0].split("#")[0].rstrip('.,;)"\'')
-        if not clean_url.startswith("https://bandcamp.com/") and not clean_url.startswith("http://bandcamp.com/"):
+
+        # Исключаем служебные ссылки вида https://bandcamp.com/album/... (нам нужны поддомены артистов)
+        if (
+            clean_url.startswith("https://")
+            and ".bandcamp.com/" in clean_url
+            and not clean_url.startswith("https://bandcamp.com/")
+            and not clean_url.startswith("http://bandcamp.com/")
+        ):
             cleaned_releases.append(clean_url)
 
     unique_releases = list(dict.fromkeys(cleaned_releases))
-    print(f"🔎 Найдено уникальных релизов на странице Bandcamp: {len(unique_releases)}")
+    print(f"🔎 Итого уникальных валидных релизов: {len(unique_releases)}")
     return unique_releases
 
 def fetch_release_details(url):
