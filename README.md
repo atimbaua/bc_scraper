@@ -1,6 +1,6 @@
-# 🌌 Bandcamp Ambient Telegram Scraper Bot
+# 🌌 Bandcamp Telegram Scraper Bot
 
-Автоматический Python-бот для поиска свежих музыкальных релизов в жанре **Ambient** на Bandcamp и их публикации в Telegram-канал. 
+Автоматический Python-бот для поиска свежих музыкальных релизов на Bandcamp и их публикации в Telegram-канал. Жанр релиза устанавливается в переменной `GENRE`.
 
 Проект использует публичные и внутренние API Bandcamp, обходит защиту Cloudflare с помощью имитации TLS-отпечатка браузера (`curl_cffi`) и работает полностью бесплатно на базе **GitHub Actions**.
 
