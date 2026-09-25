@@ -114,6 +114,7 @@ curl_cffi>=0.6.0
 | Поле | Описание | Пример |
 | :--- | :--- | :--- |
 | `published_at_utc` | Дата и время публикации (UTC) | `2026-03-30 12:00:15` |
+| `genre` | Категория / Жанр релиза | `ambient` |
 | `artist` | Исполнитель / Лейбл | `Joe Fujinoki` |
 | `album_title` | Название альбома/трека | `Glass Torso` |
 | `url` | Прямая ссылка на Bandcamp | `https://joefujinoki.bandcamp.com/album/glass-torso` |
