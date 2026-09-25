@@ -2,11 +2,13 @@ import os
 import re
 import json
 import html
-import time  # Добавлен импорт времени для задержек
+import time
+import csv
+from datetime import datetime
 import requests
 from bs4 import BeautifulSoup
 
-# Импорт curl_cffi для обхода Cloudflare
+# Попытка импорта curl_cffi для обхода Cloudflare
 try:
     from curl_cffi import requests as curl_requests
     CURL_CFFI_AVAILABLE = True
@@ -19,6 +21,8 @@ SCRAPERAPI_KEY = os.getenv("SCRAPERAPI_KEY")
 CLOUDFLARE_WORKER_URL = os.getenv("CLOUDFLARE_WORKER_URL")
 
 POSTED_FILE = "posted_releases.json"
+CSV_FILE = "releases_data.csv"
+MAX_POSTS_PER_RUN = 3
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -41,63 +45,72 @@ def save_posted(posted_set):
     with open(POSTED_FILE, "w", encoding="utf-8") as f:
         json.dump(list(posted_set), f, ensure_ascii=False, indent=2)
 
+def save_to_csv(details):
+    """Добавляет информацию о релизе строкой в CSV-файл."""
+    file_exists = os.path.exists(CSV_FILE)
+    
+    full_title = details.get("title_full", "")
+    # Заголовок Bandcamp обычно выглядит как "Album Name by Artist Name"
+    if " by " in full_title:
+        album_title, artist = full_title.rsplit(" by ", 1)
+    else:
+        album_title = full_title
+        artist = "Неизвестен"
+
+    published_at = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    tags_str = ", ".join(details.get("tags", []))
+
+    with open(CSV_FILE, mode="a", encoding="utf-8", newline="") as f:
+        writer = csv.writer(f)
+        # Если файл создается впервые — записываем заголовки колонок
+        if not file_exists:
+            writer.writerow(["published_at_utc", "artist", "album_title", "url", "tags", "image_url"])
+        
+        writer.writerow([
+            published_at,
+            artist.strip(),
+            album_title.strip(),
+            details.get("link", ""),
+            tags_str,
+            details.get("image", "")
+        ])
+
 def is_valid_bandcamp_page(text):
-    """Проверяет, что получен настоящий HTML Bandcamp, а не заглушка Cloudflare."""
     if not text:
         return False
     return len(text) > 10000 and ("data-blob" in text or "bandcamp" in text.lower())
 
 def fetch_html(target_url):
-    """
-    Каскадный запрос: пробует способы по очереди, пока не получит валидный HTML (>10 КБ).
-    """
-    # 1. Пробуем curl_cffi (Chrome 120) — бесплатно, прямо из GitHub Actions
     if CURL_CFFI_AVAILABLE:
-        print(f" [СПОСОБ 1]: Пробуем curl_cffi (Chrome 120)...")
         try:
             res = curl_requests.get(target_url, headers=HEADERS, impersonate="chrome120", timeout=30)
             if res.status_code == 200 and is_valid_bandcamp_page(res.text):
-                print(f"    Успех через curl_cffi! Размер: {len(res.text)} байт")
                 return res.text
-            else:
-                size = len(res.text) if res.text else 0
-                print(f"   ⚠️ curl_cffi вернул размер {size} байт (недостаточно). Пробуем следующий метод...")
         except Exception as e:
-            print(f"   ⚠️ Ошибка curl_cffi: {e}")
+            print(f" Ошибка curl_cffi: {e}")
 
-    # 2. Пробуем ScraperAPI с принудительным JS-рендерингом
     if SCRAPERAPI_KEY:
-        print(f" [СПОСОБ 2]: Пробуем ScraperAPI (render=true)...")
         req_url = f"http://api.scraperapi.com?api_key={SCRAPERAPI_KEY}&url={target_url}&render=true"
         try:
             res = requests.get(req_url, headers=HEADERS, timeout=60)
             if res.status_code == 200 and is_valid_bandcamp_page(res.text):
-                print(f"    Успех через ScraperAPI! Размер: {len(res.text)} байт")
                 return res.text
-            else:
-                size = len(res.text) if res.text else 0
-                print(f"   ⚠️ ScraperAPI вернул размер {size} байт.")
         except Exception as e:
-            print(f"   ⚠️ Ошибка ScraperAPI: {e}")
+            print(f" Ошибка ScraperAPI: {e}")
 
-    # 3. Пробуем Cloudflare Worker
     if CLOUDFLARE_WORKER_URL:
-        print(f" [СПОСОБ 3]: Пробуем Cloudflare Worker...")
         sep = "&" if "?" in CLOUDFLARE_WORKER_URL else "?"
         req_url = f"{CLOUDFLARE_WORKER_URL}{sep}url={target_url}"
         try:
             res = requests.get(req_url, headers=HEADERS, timeout=30)
             if res.status_code == 200 and is_valid_bandcamp_page(res.text):
-                print(f"    Успех через Cloudflare Worker! Размер: {len(res.text)} байт")
                 return res.text
         except Exception as e:
-            print(f"   ⚠️ Ошибка Worker: {e}")
+            print(f" Ошибка Worker: {e}")
 
-    print("❌ Все способы запроса вернули ошибку или заглушку.")
     return None
 
 def extract_urls_from_json(obj):
-    """Рекурсивно извлекает ссылки на релизы из JSON структуры Bandcamp."""
     urls = []
     if isinstance(obj, dict):
         for key, value in obj.items():
@@ -112,47 +125,39 @@ def extract_urls_from_json(obj):
     return urls
 
 def get_new_ambient_releases():
-    """Собирает ссылки на новые Ambient релизы с Bandcamp."""
     releases = []
     target_url = "https://bandcamp.com/tag/ambient?sort_field=date"
     
     html_text = fetch_html(target_url)
     if not html_text:
-        print("❌ Не удалось загрузить страницу Bandcamp.")
+        print(" Не удалось загрузить страницу Bandcamp.")
         return []
 
     soup = BeautifulSoup(html_text, "html.parser")
 
-    # Метод 1: Извлечение из data-blob (JSON контейнер Bandcamp)
     pagedata = soup.find(attrs={"data-blob": True})
     if pagedata and pagedata.get("data-blob"):
         try:
             blob_data = json.loads(pagedata["data-blob"])
             json_urls = extract_urls_from_json(blob_data)
             releases.extend(json_urls)
-            print(f"Извлечено из JSON data-blob: {len(json_urls)} ссылок")
         except Exception as e:
             print(f"Ошибка разбора data-blob: {e}")
 
-    # Метод 2: Резервный поиск Regex по всему тексту страницы
     clean_text = html.unescape(html_text).replace(r'\/', '/').replace(r'\\/', '/')
     pattern = r'https?://[a-zA-Z0-9.-]+\.bandcamp\.com/(?:album|track)/[^\s"\'<>\\?#]+'
     found_urls = re.findall(pattern, clean_text)
     releases.extend(found_urls)
 
-    # Фильтрация и очистка ссылок
     cleaned_releases = []
     for url in releases:
         clean_url = url.split("?")[0].split("#")[0].rstrip('.,;)"\'')
         if not clean_url.startswith("https://bandcamp.com/") and not clean_url.startswith("http://bandcamp.com/"):
             cleaned_releases.append(clean_url)
 
-    unique_releases = list(dict.fromkeys(cleaned_releases))
-    print(f"Итого найдено уникальных релизов: {len(unique_releases)}")
-    return unique_releases
+    return list(dict.fromkeys(cleaned_releases))
 
 def fetch_release_details(url):
-    """Извлекает обложку, название и описание конкретного альбома."""
     html_text = fetch_html(url)
     if not html_text:
         return None
@@ -178,7 +183,6 @@ def fetch_release_details(url):
     }
 
 def send_to_telegram(release):
-    """Отправляет готовый пост в Telegram-канал."""
     api_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
 
     title = html.escape(release["title_full"])
@@ -208,9 +212,6 @@ def send_to_telegram(release):
     resp = requests.post(api_url, data=payload, timeout=20)
     return resp.ok
 
-# Лимит публикаций за один запуск (чтобы не заспамить канал)
-MAX_POSTS_PER_RUN = 3
-
 def main():
     if not TELEGRAM_BOT_TOKEN:
         print("Ошибка: Не задан TELEGRAM_BOT_TOKEN")
@@ -220,11 +221,9 @@ def main():
     release_links = get_new_ambient_releases()
 
     new_posts = 0
-    # Идем от старых к новым
     for link in reversed(release_links):
-        # Если достигли лимита за этот запуск — останавливаемся
         if new_posts >= MAX_POSTS_PER_RUN:
-            print(f" Достигнут лимит в {MAX_POSTS_PER_RUN} постов за запуск. Остановка.")
+            print(f"Достигнут лимит в {MAX_POSTS_PER_RUN} постов за запуск. Остановка.")
             break
 
         if link in posted:
@@ -237,8 +236,8 @@ def main():
         print(f"Публикация: {details['title_full']}")
         if send_to_telegram(details):
             posted.add(link)
+            save_to_csv(details)  # <--- СОХРАНЕНИЕ В CSV
             new_posts += 1
-            # Пауза 3 секунды между постами, чтобы Telegram не заблокировал за спам
             time.sleep(3)
         else:
             print(f"Не удалось отправить в Telegram: {link}")
