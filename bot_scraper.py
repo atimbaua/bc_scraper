@@ -165,7 +165,9 @@ def get_new_ambient_releases():
         if not clean_url.startswith("https://bandcamp.com/") and not clean_url.startswith("http://bandcamp.com/"):
             cleaned_releases.append(clean_url)
 
-    return list(dict.fromkeys(cleaned_releases))
+    unique_releases = list(dict.fromkeys(cleaned_releases))
+    print(f"🔎 Найдено уникальных релизов на странице Bandcamp: {len(unique_releases)}")
+    return unique_releases
 
 def fetch_release_details(url):
     html_text = fetch_html(url)
@@ -227,35 +229,43 @@ def main():
         print("Ошибка: Не задан TELEGRAM_BOT_TOKEN")
         return
 
-    # Создаём CSV сразу, если его еще нет
     init_csv_file()
 
     posted = load_posted()
     release_links = get_new_ambient_releases()
 
+    if not release_links:
+        print("ℹ️ Ссылок на релизы не обнаружено.")
+        return
+
+    # Считаем, сколько из найденных релизов уже было в базе
+    already_posted_count = sum(1 for link in release_links if link in posted)
+    new_to_process = [link for link in release_links if link not in posted]
+
+    print(f"📊 Уже опубликовано ранее: {already_posted_count}")
+    print(f"✨ Новых релизов для публикации: {len(new_to_process)}")
+
     new_posts = 0
-    for link in reversed(release_links):
+    for link in reversed(new_to_process):
         if new_posts >= MAX_POSTS_PER_RUN:
             print(f"Достигнут лимит в {MAX_POSTS_PER_RUN} постов за запуск. Остановка.")
             break
-
-        if link in posted:
-            continue
 
         details = fetch_release_details(link)
         if not details or not details["image"]:
             continue
 
-        print(f"Публикация: {details['title_full']}")
+        print(f"🚀 Публикация: {details['title_full']}")
         if send_to_telegram(details):
             posted.add(link)
             save_to_csv(details)
             new_posts += 1
             time.sleep(3)
         else:
-            print(f"Не удалось отправить в Telegram: {link}")
+            print(f"❌ Не удалось отправить в Telegram: {link}")
 
     save_posted(posted)
+    print(f"🏁 Завершено. Опубликовано новых релизов: {new_posts}")
     print(f"Завершено. Опубликовано новых релизов: {new_posts}")
 
 if __name__ == "__main__":
