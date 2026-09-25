@@ -12,30 +12,39 @@ try:
 except ImportError:
     CURL_CFFI_AVAILABLE = False
 
+# ==============================================================================
+# НАСТРОЙКИ (Изменяйте жанр и параметризацию здесь)
+# ==============================================================================
+GENRE = "techno"          # Жанр Bandcamp (например: ambient, post-rock, dungeon-synth, synthwave)
+MAX_POSTS_PER_RUN = 3       # Лимит публикаций за один запуск
+POSTED_FILE = "posted_releases.json"
+CSV_FILE = "releases_data.csv"
+
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "@bc_ambient")
 SCRAPERAPI_KEY = os.getenv("SCRAPERAPI_KEY")
 
-POSTED_FILE = "posted_releases.json"
-CSV_FILE = "releases_data.csv"
-MAX_POSTS_PER_RUN = 5
+def get_headers():
+    """Динамическое формирование заголовков под выбранный жанр."""
+    return {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Content-Type": "application/json",
+        "X-Requested-With": "XMLHttpRequest",
+        "Referer": f"https://bandcamp.com/tag/{GENRE}",
+        "Origin": "https://bandcamp.com"
+    }
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Accept": "application/json, text/javascript, */*; q=0.01",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Content-Type": "application/json",
-    "X-Requested-With": "XMLHttpRequest",
-    "Referer": "https://bandcamp.com/tag/ambient",
-    "Origin": "https://bandcamp.com"
-}
-
+# ==============================================================================
+# РАБОТА С ДАННЫМИ (CSV & JSON)
+# ==============================================================================
 def init_csv_file():
     """Гарантирует существование CSV-файла с заголовками при запуске."""
     if not os.path.exists(CSV_FILE):
         with open(CSV_FILE, mode="w", encoding="utf-8", newline="") as f:
             writer = csv.writer(f)
-            writer.writerow(["published_at_utc", "artist", "album_title", "url", "tags", "image_url"])
+            writer.writerow(["published_at_utc", "genre", "artist", "album_title", "url", "tags", "image_url"])
 
 def load_posted():
     """Загружает список уже опубликованных релизов."""
@@ -68,6 +77,7 @@ def save_to_csv(details):
         writer = csv.writer(f)
         writer.writerow([
             published_at,
+            GENRE,
             artist.strip(),
             album_title.strip(),
             details.get("link", ""),
@@ -75,14 +85,18 @@ def save_to_csv(details):
             details.get("image", "")
         ])
 
+# ==============================================================================
+# ПАРСИНГ API BANDCAMP
+# ==============================================================================
 def fetch_from_discover_api():
     """Способ 1: Публичное GET API Discover Bandcamp."""
-    url = "https://bandcamp.com/api/discover/3/get_web?g=ambient&s=date&p=0"
-    print(" [МЕТОД 1]: Пробуем GET Discover API...")
+    url = f"https://bandcamp.com/api/discover/3/get_web?g={GENRE}&s=date&p=0"
+    headers = get_headers()
+    print(f" [МЕТОД 1]: Пробуем GET Discover API ({GENRE})...")
 
     if CURL_CFFI_AVAILABLE:
         try:
-            res = curl_requests.get(url, headers=HEADERS, impersonate="chrome120", timeout=30)
+            res = curl_requests.get(url, headers=headers, impersonate="chrome120", timeout=30)
             if res.status_code == 200:
                 data = res.json()
                 items = data.get("items", [])
@@ -96,7 +110,7 @@ def fetch_from_discover_api():
     if SCRAPERAPI_KEY:
         try:
             scraper_url = f"http://api.scraperapi.com?api_key={SCRAPERAPI_KEY}&url={url}"
-            res = requests.get(scraper_url, headers=HEADERS, timeout=40)
+            res = requests.get(scraper_url, headers=headers, timeout=40)
             if res.status_code == 200:
                 data = res.json()
                 items = data.get("items", [])
@@ -111,20 +125,21 @@ def fetch_from_discover_api():
 def fetch_from_hub_api():
     """Способ 2: Внутреннее POST API Dig Deeper."""
     url = "https://bandcamp.com/api/hub/2/dig_deeper"
+    headers = get_headers()
     payload = {
         "filters": {
             "format": "all",
             "location": 0,
             "sort": "date",
-            "tags": ["ambient"]
+            "tags": [GENRE]
         },
         "page": 1
     }
-    print(" [МЕТОД 2]: Пробуем POST Dig Deeper API...")
+    print(f" [МЕТОД 2]: Пробуем POST Dig Deeper API ({GENRE})...")
 
     if CURL_CFFI_AVAILABLE:
         try:
-            res = curl_requests.post(url, json=payload, headers=HEADERS, impersonate="chrome120", timeout=30)
+            res = curl_requests.post(url, json=payload, headers=headers, impersonate="chrome120", timeout=30)
             if res.status_code == 200:
                 data = res.json()
                 items = data.get("items", [])
@@ -151,7 +166,6 @@ def parse_item_details(item):
         or item.get("link")
     )
 
-    # Если готового URL нет, собираем из url_hints
     if not link and isinstance(item.get("url_hints"), dict):
         hints = item["url_hints"]
         subdomain = hints.get("subdomain")
@@ -160,7 +174,6 @@ def parse_item_details(item):
         if subdomain and slug:
             link = f"https://{subdomain}.bandcamp.com/{item_type}/{slug}"
 
-    # Если прямого URL нет, собираем из полей subdomain и slug
     if not link and item.get("subdomain") and item.get("slug"):
         subdomain = item["subdomain"]
         slug = item["slug"]
@@ -189,7 +202,7 @@ def parse_item_details(item):
         item.get("title")
         or item.get("album_title")
         or item.get("primary_text")
-        or "Ambient Release"
+        or f"{GENRE.capitalize()} Release"
     )
 
     title_full = f"{title} by {artist}"
@@ -198,9 +211,9 @@ def parse_item_details(item):
     art_id = item.get("art_id") or item.get("primary_art_id") or item.get("image_id")
     image_url = f"https://f4.bcbits.com/img/a{art_id}_10.jpg" if art_id else ""
 
-    genre = item.get("genre_text", "ambient")
-    tags = ["ambient"]
-    if genre and genre.lower() != "ambient":
+    genre = item.get("genre_text", GENRE)
+    tags = [GENRE]
+    if genre and genre.lower() != GENRE.lower():
         tags.append(genre.lower())
 
     return {
@@ -208,20 +221,26 @@ def parse_item_details(item):
         "artist": artist,
         "album_title": title,
         "image": image_url,
-        "description": f"New ambient release from {artist}.",
+        "description": f"New {GENRE} release from {artist}.",
         "tags": tags,
         "link": link
     }
 
+# ==============================================================================
+# ОТПРАВКА В TELEGRAM
+# ==============================================================================
 def send_to_telegram(release):
     api_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
 
     title = html.escape(release["title_full"])
     desc = html.escape(release["description"])
 
+    # Преобразование тегов в хэштеги (замена пробелов и дефисов на подчёркивания)
     tags_list = [f"#{t.lower().replace('-', '_').replace(' ', '_')}" for t in release["tags"]]
-    if "#ambient" not in tags_list:
-        tags_list.insert(0, "#ambient")
+    main_hashtag = f"#{GENRE.lower().replace('-', '_').replace(' ', '_')}"
+
+    if main_hashtag not in tags_list:
+        tags_list.insert(0, main_hashtag)
     tags_str = " ".join(tags_list)
 
     caption = (
@@ -241,6 +260,9 @@ def send_to_telegram(release):
     resp = requests.post(api_url, data=payload, timeout=20)
     return resp.ok
 
+# ==============================================================================
+# ГЛАВНЫЙ ЦИКЛ (MAIN)
+# ==============================================================================
 def main():
     if not TELEGRAM_BOT_TOKEN:
         print("Ошибка: Не задан TELEGRAM_BOT_TOKEN")
@@ -248,6 +270,8 @@ def main():
 
     init_csv_file()
     posted = load_posted()
+
+    print(f"🎯 Выбранный жанр: {GENRE}")
 
     raw_items = fetch_from_discover_api()
     if not raw_items:
@@ -262,12 +286,6 @@ def main():
         details = parse_item_details(item)
         if details and details["link"]:
             releases.append(details)
-
-    if raw_items and len(releases) == 0:
-        print("⚠️ Не удалось разобрать элементы. Ключи первого элемента:")
-        if isinstance(raw_items[0], dict):
-            print(list(raw_items[0].keys()))
-            print("Пример объекта:", json.dumps(raw_items[0], ensure_ascii=False)[:300])
 
     print(f"🔎 Успешно распознано релизов из API: {len(releases)}")
 
