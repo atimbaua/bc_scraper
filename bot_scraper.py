@@ -1,12 +1,10 @@
 import os
-import re
 import json
 import html
 import time
 import csv
 from datetime import datetime
 import requests
-from bs4 import BeautifulSoup
 
 try:
     from curl_cffi import requests as curl_requests
@@ -27,7 +25,9 @@ HEADERS = {
     "Accept": "application/json, text/javascript, */*; q=0.01",
     "Accept-Language": "en-US,en;q=0.9",
     "Content-Type": "application/json",
-    "X-Requested-With": "XMLHttpRequest"
+    "X-Requested-With": "XMLHttpRequest",
+    "Referer": "https://bandcamp.com/tag/ambient",
+    "Origin": "https://bandcamp.com"
 }
 
 def init_csv_file():
@@ -75,9 +75,42 @@ def save_to_csv(details):
             details.get("image", "")
         ])
 
-def fetch_from_bandcamp_api():
-    """Получает свежие ambient релизы через внутреннее JSON API Bandcamp."""
-    api_url = "https://bandcamp.com/api/hub/2/dig_deeper"
+def fetch_from_discover_api():
+    """Способ 1: Публичное GET API Discover Bandcamp."""
+    url = "https://bandcamp.com/api/discover/3/get_web?g=ambient&s=date&p=0"
+    print(" [МЕТОД 1]: Пробуем GET Discover API...")
+    
+    if CURL_CFFI_AVAILABLE:
+        try:
+            res = curl_requests.get(url, headers=HEADERS, impersonate="chrome120", timeout=30)
+            if res.status_code == 200:
+                data = res.json()
+                items = data.get("items", [])
+                if items:
+                    print(f"    Успех Discover API (curl_cffi)! Найдено релизов: {len(items)}")
+                    return items
+            print(f"   ⚠️ Discover API (curl_cffi): Код {res.status_code}, Ответ: {res.text[:100]}")
+        except Exception as e:
+            print(f"   ⚠️ Ошибка Discover API (curl_cffi): {e}")
+
+    if SCRAPERAPI_KEY:
+        try:
+            scraper_url = f"http://api.scraperapi.com?api_key={SCRAPERAPI_KEY}&url={url}"
+            res = requests.get(scraper_url, headers=HEADERS, timeout=40)
+            if res.status_code == 200:
+                data = res.json()
+                items = data.get("items", [])
+                if items:
+                    print(f"    Успех Discover API (ScraperAPI)! Найдено релизов: {len(items)}")
+                    return items
+        except Exception as e:
+            print(f"   ⚠️ Ошибка Discover API (ScraperAPI): {e}")
+
+    return []
+
+def fetch_from_hub_api():
+    """Способ 2: Внутреннее POST API Dig Deeper."""
+    url = "https://bandcamp.com/api/hub/2/dig_deeper"
     payload = {
         "filters": {
             "format": "all",
@@ -87,63 +120,34 @@ def fetch_from_bandcamp_api():
         },
         "page": 1
     }
+    print(" [МЕТОД 2]: Пробуем POST Dig Deeper API...")
 
-    # 1. Попытка через curl_cffi
     if CURL_CFFI_AVAILABLE:
-        print(" [API 1]: Пробуем curl_cffi POST...")
         try:
-            res = curl_requests.post(api_url, json=payload, headers=HEADERS, impersonate="chrome120", timeout=30)
-            if res.status_code == 200 and "items" in res.text:
+            res = curl_requests.post(url, json=payload, headers=HEADERS, impersonate="chrome120", timeout=30)
+            if res.status_code == 200:
                 data = res.json()
                 items = data.get("items", [])
-                print(f"    Успех API curl_cffi! Получено релизов: {len(items)}")
-                return items
-            print(f"   ⚠️ curl_cffi API: Код {res.status_code}, размер {len(res.text)} байт")
+                if items:
+                    print(f"    Успех Dig Deeper API (curl_cffi)! Найдено релизов: {len(items)}")
+                    return items
+            print(f"   ⚠️ Dig Deeper API (curl_cffi): Код {res.status_code}, Ответ: {res.text[:100]}")
         except Exception as e:
-            print(f"   ⚠️ Ошибка API curl_cffi: {e}")
-
-    # 2. Попытка через ScraperAPI
-    if SCRAPERAPI_KEY:
-        print(" [API 2]: Пробуем ScraperAPI POST...")
-        scraper_url = f"http://api.scraperapi.com?api_key={SCRAPERAPI_KEY}&url={api_url}"
-        try:
-            res = requests.post(scraper_url, json=payload, headers={"Content-Type": "application/json"}, timeout=40)
-            if res.status_code == 200 and "items" in res.text:
-                data = res.json()
-                items = data.get("items", [])
-                print(f"    Успех API ScraperAPI! Получено релизов: {len(items)}")
-                return items
-            print(f"   ⚠️ ScraperAPI API: Код {res.status_code}, размер {len(res.text)} байт")
-        except Exception as e:
-            print(f"   ⚠️ Ошибка API ScraperAPI: {e}")
-
-    # 3. Прямой запрос
-    print(" [API 3]: Прямой POST запрос...")
-    try:
-        res = requests.post(api_url, json=payload, headers=HEADERS, timeout=20)
-        if res.status_code == 200 and "items" in res.text:
-            data = res.json()
-            items = data.get("items", [])
-            print(f"    Успех прямого API! Получено релизов: {len(items)}")
-            return items
-        print(f"   ⚠️ Прямой API запрос: Код {res.status_code}, размер {len(res.text)} байт")
-    except Exception as e:
-        print(f"   ⚠️ Ошибка прямого API запроса: {e}")
+            print(f"   ⚠️ Ошибка Dig Deeper API (curl_cffi): {e}")
 
     return []
 
 def parse_item_details(item):
-    """Преобразует объект релиза из API в стандартный формат бота."""
-    link = item.get("tralbum_url") or item.get("item_url")
+    """Преобразует объект релиза из API в структуру данных бота."""
+    link = item.get("tralbum_url") or item.get("item_url") or item.get("page_url")
     if not link:
         return None
 
-    artist = item.get("band_name", "Неизвестный исполнитель")
-    title = item.get("title", "Ambient Release")
+    artist = item.get("band_name") or item.get("artist") or "Неизвестный исполнитель"
+    title = item.get("title") or item.get("album_title") or "Ambient Release"
     title_full = f"{title} by {artist}"
 
-    # Формируем прямую ссылку на обложку высокими качеством по art_id
-    art_id = item.get("art_id")
+    art_id = item.get("art_id") or item.get("primary_art_id")
     image_url = f"https://f4.bcbits.com/img/a{art_id}_10.jpg" if art_id else ""
 
     genre = item.get("genre_text", "ambient")
@@ -197,12 +201,15 @@ def main():
     init_csv_file()
     posted = load_posted()
 
-    raw_items = fetch_from_bandcamp_api()
+    # Сначала пробуем GET Discover API, если пусто — пробуем POST Dig Deeper API
+    raw_items = fetch_from_discover_api()
     if not raw_items:
-        print("❌ Не удалось получить список релизов через Bandcamp API.")
+        raw_items = fetch_from_hub_api()
+
+    if not raw_items:
+        print("❌ Не удалось получить список релизов через API Bandcamp.")
         return
 
-    # Собираем валидные объекты релизов
     releases = []
     for item in raw_items:
         details = parse_item_details(item)
@@ -211,7 +218,6 @@ def main():
 
     print(f"🔎 Успешно распознано релизов из API: {len(releases)}")
 
-    # Фильтруем те, что уже публиковали
     already_posted = [r for r in releases if r["link"] in posted]
     new_releases = [r for r in releases if r["link"] not in posted]
 
