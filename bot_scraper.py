@@ -8,7 +8,6 @@ from datetime import datetime
 import requests
 from bs4 import BeautifulSoup
 
-# Попытка импорта curl_cffi для обхода Cloudflare
 try:
     from curl_cffi import requests as curl_requests
     CURL_CFFI_AVAILABLE = True
@@ -30,6 +29,13 @@ HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
 }
 
+def init_csv_file():
+    """Гарантирует существование CSV-файла с заголовками при запуске."""
+    if not os.path.exists(CSV_FILE):
+        with open(CSV_FILE, mode="w", encoding="utf-8", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["published_at_utc", "artist", "album_title", "url", "tags", "image_url"])
+
 def load_posted():
     """Загружает список уже опубликованных релизов."""
     if os.path.exists(POSTED_FILE):
@@ -47,10 +53,7 @@ def save_posted(posted_set):
 
 def save_to_csv(details):
     """Добавляет информацию о релизе строкой в CSV-файл."""
-    file_exists = os.path.exists(CSV_FILE)
-    
     full_title = details.get("title_full", "")
-    # Заголовок Bandcamp обычно выглядит как "Album Name by Artist Name"
     if " by " in full_title:
         album_title, artist = full_title.rsplit(" by ", 1)
     else:
@@ -62,10 +65,6 @@ def save_to_csv(details):
 
     with open(CSV_FILE, mode="a", encoding="utf-8", newline="") as f:
         writer = csv.writer(f)
-        # Если файл создается впервые — записываем заголовки колонок
-        if not file_exists:
-            writer.writerow(["published_at_utc", "artist", "album_title", "url", "tags", "image_url"])
-        
         writer.writerow([
             published_at,
             artist.strip(),
@@ -81,32 +80,44 @@ def is_valid_bandcamp_page(text):
     return len(text) > 10000 and ("data-blob" in text or "bandcamp" in text.lower())
 
 def fetch_html(target_url):
+    """
+    Каскадный запрос с подробным логом каждой попытки.
+    """
+    # 1. Попытка через curl_cffi
     if CURL_CFFI_AVAILABLE:
+        print(" [СПОСОБ 1]: Пробуем curl_cffi...")
         try:
             res = curl_requests.get(target_url, headers=HEADERS, impersonate="chrome120", timeout=30)
             if res.status_code == 200 and is_valid_bandcamp_page(res.text):
+                print(f"    Успех curl_cffi! Размер: {len(res.text)} байт")
                 return res.text
+            print(f"   ⚠️ curl_cffi: Код {res.status_code}, размер {len(res.text) if res.text else 0} байт")
         except Exception as e:
-            print(f" Ошибка curl_cffi: {e}")
+            print(f"   ⚠️ Ошибка curl_cffi: {e}")
 
+    # 2. Попытка через ScraperAPI (обычный запрос без render=true для экономии лимитов)
     if SCRAPERAPI_KEY:
-        req_url = f"http://api.scraperapi.com?api_key={SCRAPERAPI_KEY}&url={target_url}&render=true"
+        print(" [СПОСОБ 2]: Пробуем ScraperAPI...")
+        req_url = f"http://api.scraperapi.com?api_key={SCRAPERAPI_KEY}&url={target_url}"
         try:
-            res = requests.get(req_url, headers=HEADERS, timeout=60)
+            res = requests.get(req_url, headers=HEADERS, timeout=40)
             if res.status_code == 200 and is_valid_bandcamp_page(res.text):
+                print(f"    Успех ScraperAPI! Размер: {len(res.text)} байт")
                 return res.text
+            print(f"   ⚠️ ScraperAPI: Код {res.status_code}, размер {len(res.text) if res.text else 0} байт")
         except Exception as e:
-            print(f" Ошибка ScraperAPI: {e}")
+            print(f"   ⚠️ Ошибка ScraperAPI: {e}")
 
-    if CLOUDFLARE_WORKER_URL:
-        sep = "&" if "?" in CLOUDFLARE_WORKER_URL else "?"
-        req_url = f"{CLOUDFLARE_WORKER_URL}{sep}url={target_url}"
-        try:
-            res = requests.get(req_url, headers=HEADERS, timeout=30)
-            if res.status_code == 200 and is_valid_bandcamp_page(res.text):
-                return res.text
-        except Exception as e:
-            print(f" Ошибка Worker: {e}")
+    # 3. Попытка прямой запрос (Fallback)
+    print(" [СПОСОБ 3]: Прямой запрос requests...")
+    try:
+        res = requests.get(target_url, headers=HEADERS, timeout=20)
+        if res.status_code == 200 and is_valid_bandcamp_page(res.text):
+            print(f"    Успех прямой запрос! Размер: {len(res.text)} байт")
+            return res.text
+        print(f"   ⚠️ Прямой запрос: Код {res.status_code}, размер {len(res.text) if res.text else 0} байт")
+    except Exception as e:
+        print(f"   ⚠️ Ошибка прямого запроса: {e}")
 
     return None
 
@@ -125,15 +136,14 @@ def extract_urls_from_json(obj):
     return urls
 
 def get_new_ambient_releases():
-    releases = []
     target_url = "https://bandcamp.com/tag/ambient?sort_field=date"
-    
     html_text = fetch_html(target_url)
     if not html_text:
-        print(" Не удалось загрузить страницу Bandcamp.")
+        print("❌ Не удалось загрузить страницу Bandcamp ни одним из способов.")
         return []
 
     soup = BeautifulSoup(html_text, "html.parser")
+    releases = []
 
     pagedata = soup.find(attrs={"data-blob": True})
     if pagedata and pagedata.get("data-blob"):
@@ -217,6 +227,9 @@ def main():
         print("Ошибка: Не задан TELEGRAM_BOT_TOKEN")
         return
 
+    # Создаём CSV сразу, если его еще нет
+    init_csv_file()
+
     posted = load_posted()
     release_links = get_new_ambient_releases()
 
@@ -236,7 +249,7 @@ def main():
         print(f"Публикация: {details['title_full']}")
         if send_to_telegram(details):
             posted.add(link)
-            save_to_csv(details)  # <--- СОХРАНЕНИЕ В CSV
+            save_to_csv(details)
             new_posts += 1
             time.sleep(3)
         else:
