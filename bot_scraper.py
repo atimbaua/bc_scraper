@@ -322,7 +322,7 @@ def parse_item_details(item, target_genre):
     }
 
 # ==============================================================================
-# ПАРСИНГ АРТИСТОВ / ЛЕЙБЛОВ
+# ПАРСИНГ АРТИСТОВ / ЛЕЙБЛОВ (ВАРИАНТ 2: СОРТИРОВКА ПО ID ИЗОБРАЖЕНИЯ)
 # ==============================================================================
 def extract_subdomain(target):
     target = target.strip().lower()
@@ -336,10 +336,9 @@ def fetch_from_artist_or_label(target):
     if not subdomain:
         return []
 
-    # Возвращаем запросы на /music, так как там хранится полный каталог
     url = f"https://{subdomain}.bandcamp.com/music"
     headers = get_headers()
-    print(f" 👤 [АРТИСТ/ЛЕЙБЛ]: Проверяем каталог {subdomain} ({url})...")
+    print(f" 👤 [АРТИСТ/ЛЕЙБЛ]: Проверяем {subdomain} ({url})...")
 
     html_text = ""
     if CURL_CFFI_AVAILABLE:
@@ -381,6 +380,7 @@ def fetch_from_artist_or_label(target):
     items = []
     seen_links = set()
 
+    # 1. Парсим JSON с атрибута data-client-items
     client_items_match = re.search(r'data-client-items="([^"]+)"', html_text)
     if client_items_match:
         try:
@@ -409,6 +409,7 @@ def fetch_from_artist_or_label(target):
         except Exception as e:
             print(f"   ⚠️ Не удалось распарсить data-client-items: {e}")
 
+    # 2. Если JSON пуст, парсим через HTML блоки
     if not items:
         grid_li_blocks = re.findall(r'<li[^>]*class="[^"]*music-grid-item[^"]*"[^>]*>(.*?)</li>', html_text, re.DOTALL | re.IGNORECASE)
         for block in grid_li_blocks:
@@ -444,8 +445,18 @@ def fetch_from_artist_or_label(target):
                     "genre": "artist/label"
                 })
 
-    # ВАЖНО: На странице /music старые релизы идут первыми. Инвертируем список, чтобы новые проверялись в начале!
-    items.reverse()
+    # ==========================================================================
+    # ВАРИАНТ 2: СОРТИРОВКА ПО ID ИЗОБРАЖЕНИЯ (art_id)
+    # На Bandcamp арт-айди у новых релизов ВСЕГДА больше, чем у старых.
+    # ==========================================================================
+    def get_numeric_id(item):
+        match = re.search(r'/a(\d+)_\d+\.jpg', item.get("image", ""))
+        if match:
+            return int(match.group(1))
+        return 0
+
+    # Сортируем: от самых больших ID (самые свежие) к наименьшим (самые старые)
+    items.sort(key=get_numeric_id, reverse=True)
 
     print(f"    Найдено релизов у {artist_name}: {len(items)}")
     return items
@@ -513,6 +524,7 @@ def main():
     releases = []
     seen_links = set()
 
+    # 1. Собираем релизы по жанрам
     for genre in GENRES:
         raw_items = fetch_from_discover_api(genre)
         for item in raw_items:
@@ -521,6 +533,7 @@ def main():
                 seen_links.add(details["link"])
                 releases.append(details)
 
+    # 2. Собираем релизы по артистам/лейблам (УЖЕ отсортированные по свежести)
     for target in TARGET_ARTISTS_AND_LABELS:
         artist_items = fetch_from_artist_or_label(target)
         for details in artist_items:
@@ -534,6 +547,7 @@ def main():
     print(f"✨ Новых не опубликованных ранее релизов: {len(new_releases)}")
 
     new_posts = 0
+    # Прямой проход без повторного reversed()
     for release in new_releases:
         if new_posts >= MAX_POSTS_PER_RUN:
             print(f"🛑 Достигнут лимит в {MAX_POSTS_PER_RUN} постов за запуск. Остановка.")
@@ -543,6 +557,7 @@ def main():
         release_date = fetch_release_date(release["link"])
 
         if not is_release_date_valid(release_date):
+            posted.add(release["link"])  # Запоминаем проверенные старые релизы
             continue
 
         print(f"🚀 Публикация в Telegram: {release['title_full']}")
