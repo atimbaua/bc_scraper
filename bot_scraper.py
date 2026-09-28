@@ -336,9 +336,10 @@ def fetch_from_artist_or_label(target):
     if not subdomain:
         return []
 
-    url = f"https://{subdomain}.bandcamp.com/"
+    # Возвращаем запросы на /music, так как там хранится полный каталог
+    url = f"https://{subdomain}.bandcamp.com/music"
     headers = get_headers()
-    print(f" 👤 [АРТИСТ/ЛЕЙБЛ]: Проверяем главную страницу {subdomain} ({url})...")
+    print(f" 👤 [АРТИСТ/ЛЕЙБЛ]: Проверяем каталог {subdomain} ({url})...")
 
     html_text = ""
     if CURL_CFFI_AVAILABLE:
@@ -443,8 +444,8 @@ def fetch_from_artist_or_label(target):
                     "genre": "artist/label"
                 })
 
-    # Разворачиваем сразу при получении, чтобы свежие релизы шли первыми
-    items = list(reversed(items))
+    # ВАЖНО: На странице /music старые релизы идут первыми. Инвертируем список, чтобы новые проверялись в начале!
+    items.reverse()
 
     print(f"    Найдено релизов у {artist_name}: {len(items)}")
     return items
