@@ -28,7 +28,7 @@ TARGET_ARTISTS_AND_LABELS = [
 MAX_DAYS_AGO = 30        # Публиковать релизы не старше N дней
 ALLOW_UPCOMING = True    # Публиковать предзаказы / анонсы
 
-MAX_POSTS_PER_RUN = 10
+MAX_POSTS_PER_RUN = 5
 POSTED_FILE = "posted_releases.json"
 CSV_FILE = "releases_data.csv"
 
@@ -95,40 +95,103 @@ def save_to_csv(details):
         ])
 
 # ==============================================================================
-# ПАРСИНГ ДАТЫ И ПРОВЕРКА КРИТЕРИЕВ
+# ПОЛНЫЙ ПАРСИНГ ДАТЫ СО СТРАНИЦЫ РЕЛИЗА
 # ==============================================================================
-def parse_date_str(date_val):
-    if not date_val:
+def parse_date_from_html(html_text):
+    if not html_text:
         return None
-    if isinstance(date_val, datetime):
-        return date_val.date()
-    
-    # Если дата передана числовым timestamp (в секундах или миллисекундах)
-    if isinstance(date_val, (int, float)):
-        if date_val > 1e11:
-            date_val /= 1000
-        return datetime.fromtimestamp(date_val, tz=timezone.utc).date()
 
-    # Парсинг ISO / текстовых строк
-    d_str = str(date_val).strip()
-    for fmt in ("%Y-%m-%d", "%d %b %Y", "%d %B %Y", "%B %d, %Y", "%b %d, %Y"):
+    # 1. Поиск "released Month DD, YYYY" или "releases Month DD, YYYY"
+    date_match = re.search(r'(?:released|releases)\s+([A-Za-z]+\s+\d{1,2},\s+\d{4})', html_text, re.IGNORECASE)
+    if date_match:
+        date_str = date_match.group(1).strip()
+        for fmt in ("%B %d, %Y", "%b %d, %Y"):
+            try:
+                return datetime.strptime(date_str, fmt).date()
+            except ValueError:
+                pass
+
+    # 2. Поиск "released DD Month YYYY" / "releases DD Month YYYY"
+    date_match_alt = re.search(r'(?:released|releases)\s+(\d{1,2}\s+[A-Za-z]+\s+\d{4})', html_text, re.IGNORECASE)
+    if date_match_alt:
+        date_str = date_match_alt.group(1).strip()
+        for fmt in ("%d %B %Y", "%d %b %Y"):
+            try:
+                return datetime.strptime(date_str, fmt).date()
+            except ValueError:
+                pass
+
+    # 3. Поиск itemprop="datePublished" content="YYYYMMDD" или "YYYY-MM-DD"
+    meta_dp = re.search(r'itemprop="datePublished"\s+content="(\d{8}|\d{4}-\d{2}-\d{2})"', html_text, re.IGNORECASE)
+    if meta_dp:
+        d_str = meta_dp.group(1).strip()
+        if len(d_str) == 8:
+            try:
+                return datetime.strptime(d_str, "%Y%m%d").date()
+            except ValueError:
+                pass
+        else:
+            try:
+                return datetime.strptime(d_str, "%Y-%m-%d").date()
+            except ValueError:
+                pass
+
+    # 4. Поиск datePublished в JSON-LD
+    json_ld = re.search(r'"datePublished"\s*:\s*"([^"]+)"', html_text)
+    if json_ld:
+        raw_d = json_ld.group(1).strip()
         try:
-            return datetime.strptime(d_str, fmt).date()
-        except ValueError:
+            if "T" in raw_d:
+                return datetime.fromisoformat(raw_d.replace("Z", "+00:00")).date()
+            return datetime.strptime(raw_d[:10], "%Y-%m-%d").date()
+        except Exception:
             pass
-
-    try:
-        if "T" in d_str:
-            return datetime.fromisoformat(d_str.replace("Z", "+00:00")).date()
-    except Exception:
-        pass
 
     return None
 
+def fetch_release_date(url):
+    """
+    Надежный забор HTML релиза через многоуровневый обход (ScraperAPI -> curl_cffi -> requests)
+    """
+    headers = get_headers()
+    html_text = ""
+
+    # 1. ScraperAPI
+    if SCRAPERAPI_KEY:
+        try:
+            clean_key = SCRAPERAPI_KEY.strip().strip('"').strip("'")
+            encoded_url = urllib.parse.quote(url, safe='')
+            scraper_url = f"http://api.scraperapi.com?api_key={clean_key}&url={encoded_url}"
+            res = requests.get(scraper_url, timeout=30)
+            if res.status_code == 200:
+                html_text = res.text
+        except Exception as e:
+            print(f"   ⚠️ Ошибка fetch_release_date (ScraperAPI): {e}")
+
+    # 2. curl_cffi
+    if not html_text and CURL_CFFI_AVAILABLE:
+        try:
+            res = curl_requests.get(url, headers=headers, impersonate="chrome120", timeout=30)
+            if res.status_code == 200:
+                html_text = res.text
+        except Exception as e:
+            print(f"   ⚠️ Ошибка fetch_release_date (curl_cffi): {e}")
+
+    # 3. Прямой requests
+    if not html_text:
+        try:
+            res = requests.get(url, headers=headers, timeout=20)
+            if res.status_code == 200:
+                html_text = res.text
+        except Exception as e:
+            print(f"   ⚠️ Ошибка fetch_release_date (requests): {e}")
+
+    return parse_date_from_html(html_text)
+
 def is_release_date_valid(release_date):
     if release_date is None:
-        print("   ⚠️ Дата релиза не найдена на странице, публикация по умолчанию.")
-        return True
+        print("   ⚠️ Дата релиза не найдена на странице, пропуск для защиты от спама.")
+        return False
 
     today = datetime.now(timezone.utc).date()
     days_diff = (today - release_date).days
@@ -261,8 +324,6 @@ def parse_item_details(item, target_genre):
     art_id = item.get("art_id") or item.get("primary_art_id") or item.get("image_id")
     image_url = f"https://f4.bcbits.com/img/a{art_id}_10.jpg" if art_id else ""
 
-    pub_date_raw = item.get("publish_date") or item.get("release_date") or item.get("published")
-
     return {
         "title_full": title_full,
         "artist": artist,
@@ -271,12 +332,11 @@ def parse_item_details(item, target_genre):
         "description": f"New {target_genre} release from {artist}.",
         "tags": [target_genre],
         "link": link,
-        "genre": target_genre,
-        "release_date": parse_date_str(pub_date_raw)
+        "genre": target_genre
     }
 
 # ==============================================================================
-# ПАРСИНГ АРТИСТОВ / ЛЕЙБЛОВ (ЧЕРЕЗ Скрытый BAND DATA API)
+# ПАРСИНГ АРТИСТОВ / ЛЕЙБЛОВ
 # ==============================================================================
 def extract_subdomain(target):
     target = target.strip().lower()
@@ -334,27 +394,19 @@ def fetch_from_artist_or_label(target):
     items = []
     seen_links = set()
 
-    # 1. Извлечение ВСЕХ альбомов из встроенного JS-объекта data-band / TrAlbumData
-    band_data_match = re.search(r'data-band="([^"]+)"', html_text) or re.search(r'data-embed="([^"]+)"', html_text)
-    
-    # Также ищем встроенные ссылки на дискографию через JS-переменные
-    grid_json_matches = re.findall(r'(\{(?:[^{}]*?"title"[^{}]*?)\})', html_text)
-
-    if band_data_match:
+    # Извлечение через JSON data-client-items
+    client_items_match = re.search(r'data-client-items="([^"]+)"', html_text)
+    if client_items_match:
         try:
-            raw_json = html.unescape(band_data_match.group(1))
-            band_json = json.loads(raw_json)
-            discog = band_json.get("discography", []) or band_json.get("grid_items", [])
-            for disc in discog:
-                path = disc.get("page_url") or disc.get("title_link") or disc.get("url")
-                title = disc.get("title")
-                art_id = disc.get("art_id") or disc.get("image_id")
-                pub_date = disc.get("publish_date") or disc.get("release_date")
-                
+            raw_json = html.unescape(client_items_match.group(1))
+            client_items = json.loads(raw_json)
+            for c_item in client_items:
+                path = c_item.get("page_url") or c_item.get("title_link")
+                title = c_item.get("title")
+                art_id = c_item.get("art_id")
                 if path and title:
                     full_link = f"https://{subdomain}.bandcamp.com{path}" if path.startswith("/") else path
                     full_link = full_link.replace(".bandcamp.com/a/", ".bandcamp.com/album/").replace(".bandcamp.com/t/", ".bandcamp.com/track/")
-                    
                     if full_link not in seen_links and ("/album/" in full_link or "/track/" in full_link):
                         seen_links.add(full_link)
                         img_url = f"https://f4.bcbits.com/img/a{art_id}_10.jpg" if art_id else ""
@@ -366,52 +418,37 @@ def fetch_from_artist_or_label(target):
                             "description": f"New release from {artist_name}.",
                             "tags": [subdomain],
                             "link": full_link,
-                            "genre": "artist/label",
-                            "release_date": parse_date_str(pub_date)
+                            "genre": "artist/label"
                         })
         except Exception as e:
-            print(f"   ⚠️ Ошибка чтения data-band: {e}")
+            print(f"   ⚠️ Ошибка чтения data-client-items: {e}")
 
-    # 2. Второй канал: извлечение ссылок напрямую из всех тегов <a> сетки
-    all_album_links = re.findall(r'href="(/(?:album|track)/[a-zA-Z0-9\-_]+)"', html_text, re.IGNORECASE)
-    for path in all_album_links:
-        full_link = f"https://{subdomain}.bandcamp.com{path}"
-        if full_link not in seen_links:
-            seen_links.add(full_link)
-            
-            # Название из URL slug в качестве запасного варианта
-            title_slug = path.split("/")[-1].replace("-", " ").title()
-            
-            # Поиск art_id рядом
-            art_match = re.search(r'f4\.bcbits\.com/img/a(\d+)_\d+\.jpg', html_text)
-            art_id = art_match.group(1) if art_match else ""
-            img_url = f"https://f4.bcbits.com/img/a{art_id}_10.jpg" if art_id else ""
+    # Запасной вход через HTML теги <a>
+    if not items:
+        all_album_links = re.findall(r'href="(/(?:album|track)/[a-zA-Z0-9\-_]+)"', html_text, re.IGNORECASE)
+        for path in all_album_links:
+            full_link = f"https://{subdomain}.bandcamp.com{path}"
+            if full_link not in seen_links:
+                seen_links.add(full_link)
+                title_slug = path.split("/")[-1].replace("-", " ").title()
+                items.append({
+                    "title_full": f"{title_slug} by {artist_name}",
+                    "artist": artist_name,
+                    "album_title": title_slug,
+                    "image": "",
+                    "description": f"New release from {artist_name}.",
+                    "tags": [subdomain],
+                    "link": full_link,
+                    "genre": "artist/label"
+                })
 
-            items.append({
-                "title_full": f"{title_slug} by {artist_name}",
-                "artist": artist_name,
-                "album_title": title_slug,
-                "image": img_url,
-                "description": f"New release from {artist_name}.",
-                "tags": [subdomain],
-                "link": full_link,
-                "genre": "artist/label",
-                "release_date": None
-            })
-
-    # СОРТИРОВКА ПО СВЕЖЕСТИ:
-    # Ищем art_id из картинки (у новых релизов art_id всегда СУЩЕСТВЕННО больше!)
+    # СОРТИРОВКА: Свежие релизы содержат бóльшие значения art_id
     def get_sort_key(item):
-        # 1. Если есть распарсенная дата
-        if item.get("release_date"):
-            return item["release_date"].strftime("%Y%m%d")
-        # 2. Иначе по цифре art_id из ссылки картинки
         match = re.search(r'/a(\d+)_\d+\.jpg', item.get("image", ""))
         if match:
-            return match.group(1).zfill(12)
-        return "000000000000"
+            return int(match.group(1))
+        return 0
 
-    # Сортируем строго ОТ СВЕЖИХ К СТАРЫМ
     items.sort(key=get_sort_key, reverse=True)
 
     print(f"    Найдено ВСЕГО релизов у {artist_name}: {len(items)}")
@@ -480,7 +517,6 @@ def main():
     releases = []
     seen_links = set()
 
-    # 1. Собираем релизы по жанрам
     for genre in GENRES:
         raw_items = fetch_from_discover_api(genre)
         for item in raw_items:
@@ -489,7 +525,6 @@ def main():
                 seen_links.add(details["link"])
                 releases.append(details)
 
-    # 2. Собираем релизы по артистам/лейблам
     for target in TARGET_ARTISTS_AND_LABELS:
         artist_items = fetch_from_artist_or_label(target)
         for details in artist_items:
@@ -510,18 +545,8 @@ def main():
 
         print(f"\n🔍 Проверка даты для: {release['title_full']}")
         
-        # Берем заранее распарсенную дату из API или делаем доп. запрос
-        release_date = release.get("release_date")
-        if not release_date:
-            # Резервный вызов проверки отдельной страницы
-            try:
-                res = requests.get(release["link"], headers=get_headers(), timeout=15)
-                if res.status_code == 200:
-                    d_match = re.search(r'(?:released|releases)\s+([A-Za-z]+\s+\d{1,2},\s+\d{4})', res.text, re.IGNORECASE)
-                    if d_match:
-                        release_date = parse_date_str(d_match.group(1))
-            except Exception:
-                pass
+        # Получаем точную дату через многоуровневый обход с ScraperAPI/curl_cffi
+        release_date = fetch_release_date(release["link"])
 
         if not is_release_date_valid(release_date):
             posted.add(release["link"])
