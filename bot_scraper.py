@@ -379,7 +379,6 @@ def fetch_from_artist_or_label(target):
         print(f"   ⚠️ Не удалось получить страницу артиста {subdomain}")
         return []
 
-    # Получаем имя артиста/лейбла
     artist_match = re.search(r'<meta\s+property="og:site_name"\s+content="([^"]+)"', html_text, re.IGNORECASE)
     if not artist_match:
         artist_match = re.search(r'<title>([^<]+)</title>', html_text, re.IGNORECASE)
@@ -388,7 +387,6 @@ def fetch_from_artist_or_label(target):
     items = []
     seen_links = set()
 
-    # 1. ОСНОВНОЙ СПОСОБ: Парсинг JSON-данных из атрибута data-client-items на <ol id="music-grid">
     client_items_match = re.search(r'data-client-items="([^"]+)"', html_text)
     if client_items_match:
         try:
@@ -417,7 +415,6 @@ def fetch_from_artist_or_label(target):
         except Exception as e:
             print(f"   ⚠️ Не удалось распарсить data-client-items: {e}")
 
-    # 2. ВТОРОЙ СПОСОБ: Если JSON отсутствует, ищем карточки элементов <li class="music-grid-item">
     if not items:
         grid_li_blocks = re.findall(r'<li[^>]*class="[^"]*music-grid-item[^"]*"[^>]*>(.*?)</li>', html_text, re.DOTALL | re.IGNORECASE)
         for block in grid_li_blocks:
@@ -453,7 +450,6 @@ def fetch_from_artist_or_label(target):
                     "genre": "artist/label"
                 })
 
-    # 3. РЕЗЕРВНЫЙ СПОСОБ: Если у артиста всего 1 релиз и Bandcamp открывает его сразу
     if not items:
         og_url = re.search(r'<meta\s+property="og:url"\s+content="([^"]+)"', html_text, re.IGNORECASE)
         og_title = re.search(r'<meta\s+property="og:title"\s+content="([^"]+)"', html_text, re.IGNORECASE)
@@ -563,8 +559,11 @@ def main():
     new_releases = [r for r in releases if r["link"] not in posted]
     print(f"✨ Новых не опубликованных ранее релизов: {len(new_releases)}")
 
+    # Меняем порядок: начинаем проверку со свежих релизов (которые на странице Bandcamp идут первыми)
+    new_releases = list(reversed(new_releases))
+
     new_posts = 0
-    for release in reversed(new_releases):
+    for release in new_releases:
         if new_posts >= MAX_POSTS_PER_RUN:
             print(f"🛑 Достигнут лимит в {MAX_POSTS_PER_RUN} постов за запуск. Остановка.")
             break
@@ -573,8 +572,6 @@ def main():
         release_date = fetch_release_date(release["link"])
 
         if not is_release_date_valid(release_date):
-            # Если дата не подходит под критерии, запоминаем релиз как обработанный, чтобы не запрашивать его снова
-            posted.add(release["link"])
             continue
 
         print(f"🚀 Публикация в Telegram: {release['title_full']}")
