@@ -5,7 +5,7 @@ import time
 import csv
 import re
 import urllib.parse
-from datetime import datetime, timezone
+from datetime import datetime, timezone, date
 import requests
 
 try:
@@ -187,7 +187,7 @@ def fetch_release_date(url):
 
 def is_release_date_valid(release_date):
     if release_date is None:
-        print("   ⚠️ Дата релиза не найдена на странице, пропуск для защиты от спама.")
+        print("   ⚠️ Дата релиза не найдена на странице, пропуск.")
         return False
 
     today = datetime.now(timezone.utc).date()
@@ -205,41 +205,7 @@ def is_release_date_valid(release_date):
         return is_ok
 
 # ==============================================================================
-# ИЗВЛЕЧЕНИЕ TRALBUM_ID СО СТРАНИЦЫ
-# ==============================================================================
-def fetch_tralbum_id_fallback(url):
-    """
-    Резервный забор tralbum_id напрямую со страницы релиза.
-    """
-    headers = get_headers()
-    html_text = ""
-    if CURL_CFFI_AVAILABLE:
-        try:
-            res = curl_requests.get(url, headers=headers, impersonate="chrome120", timeout=15)
-            if res.status_code == 200:
-                html_text = res.text
-        except Exception:
-            pass
-
-    if not html_text:
-        try:
-            res = requests.get(url, headers=headers, timeout=15)
-            if res.status_code == 200:
-                html_text = res.text
-        except Exception:
-            pass
-
-    if html_text:
-        m = re.search(r'var\s+TralbumData\s*=\s*\{[^}]*?\bid\s*:\s*(\d+)', html_text, re.IGNORECASE)
-        if m:
-            return int(m.group(1))
-        m_attr = re.search(r'data-tralbum-id="(\d+)"', html_text)
-        if m_attr:
-            return int(m_attr.group(1))
-    return 0
-
-# ==============================================================================
-# ПАРСИНГ АРТИСТОВ / ЛЕЙБЛОВ В СООТВЕТСТВИИ С TRALBUM_ID
+# ПАРСИНГ АРТИСТОВ / ЛЕЙБЛОВ
 # ==============================================================================
 def extract_subdomain(target):
     target = target.strip().lower()
@@ -307,8 +273,6 @@ def fetch_from_artist_or_label(target):
                 path = c_item.get("page_url") or c_item.get("title_link")
                 title = c_item.get("title")
                 art_id = c_item.get("art_id")
-                
-                tralbum_id = c_item.get("id") or c_item.get("item_id") or c_item.get("tralbum_id") or 0
 
                 if path and title:
                     full_link = f"https://{subdomain}.bandcamp.com{path}" if path.startswith("/") else path
@@ -317,7 +281,6 @@ def fetch_from_artist_or_label(target):
                         seen_links.add(full_link)
                         img_url = f"https://f4.bcbits.com/img/a{art_id}_10.jpg" if art_id else ""
                         raw_items.append({
-                            "tralbum_id": int(tralbum_id),
                             "title_full": f"{title} by {artist_name}",
                             "artist": artist_name,
                             "album_title": title,
@@ -339,7 +302,6 @@ def fetch_from_artist_or_label(target):
                 seen_links.add(full_link)
                 title_slug = path.split("/")[-1].replace("-", " ").title()
                 raw_items.append({
-                    "tralbum_id": 0,
                     "title_full": f"{title_slug} by {artist_name}",
                     "artist": artist_name,
                     "album_title": title_slug,
@@ -350,22 +312,7 @@ def fetch_from_artist_or_label(target):
                     "genre": "artist/label"
                 })
 
-    # 3. Дополучаем tralbum_id, если он не был вытащен из data-client-items
-    for item in raw_items:
-        if item["tralbum_id"] == 0:
-            item["tralbum_id"] = fetch_tralbum_id_fallback(item["link"])
-
-    # 4. СОБИРАЕМ ВСЕ tralbum_id В МАССИВ И СОРТИРУЕМ ПО ВОЗРАСТАНИЮ
-    tralbum_ids = [item["tralbum_id"] for item in raw_items if item["tralbum_id"] > 0]
-    tralbum_ids.sort(reverse=False)  # Сортировка по возрастанию (от меньших ID к большим)
-
-    print(f" 🔢 [TRALBUM_ID] Собран и отсортирован массив tralbum_id (по возрастанию):")
-    print(f"    {tralbum_ids}")
-
-    # 5. СОРТИРУЕМ ВСЕ РЕЛИЗЫ ПО ВОЗРАСТАНИЮ TRALBUM_ID
-    raw_items.sort(key=lambda x: x["tralbum_id"], reverse=False)
-
-    print(f"    Найдено ВСЕГО релизов у {artist_name}: {len(raw_items)}")
+    print(f"    Найдено всего релизов в каталоге {artist_name}: {len(raw_items)}")
     return raw_items
 
 # ==============================================================================
@@ -431,6 +378,7 @@ def main():
     releases = []
     seen_links = set()
 
+    # 1. Собираем все ссылки на релизы
     for target in TARGET_ARTISTS_AND_LABELS:
         artist_items = fetch_from_artist_or_label(target)
         for details in artist_items:
@@ -440,20 +388,44 @@ def main():
 
     print(f"\n🔎 Всего распознано уникальных релизов: {len(releases)}")
 
+    # 2. Фильтруем те, что ещё не публиковались
     new_releases = [r for r in releases if r["link"] not in posted]
-    print(f"✨ Новых не опубликованных ранее релизов: {len(new_releases)}")
+    print(f"✨ Не опубликованных ранее релизов: {len(new_releases)}")
 
+    if not new_releases:
+        print("🏁 Нет новых релизов для обработки.")
+        return
+
+    # 3. Извлекаем точные даты релиза для всех непостиченных альбомов
+    print(f"\n📅 Извлекаем фактические даты релизов для {len(new_releases)} релизов...")
+    for release in new_releases:
+        print(f"   🔎 Запрос даты: {release['title_full']}...")
+        release["release_date"] = fetch_release_date(release["link"])
+        time.sleep(1)
+
+    # 4. Сортируем список релизов по дате (ОТ САМЫХ СВЕЖИХ К СТАРЫМ)
+    # Релизы без даты уйдут в самый конец списка (date.min)
+    new_releases.sort(
+        key=lambda x: x["release_date"] if x["release_date"] is not None else date.min,
+        reverse=True
+    )
+
+    print("\n📊 Итоговый порядок релизов, отсортированный по дате выхода:")
+    for r in new_releases:
+        d_str = r['release_date'].strftime('%Y-%m-%d') if r['release_date'] else 'Дата неизвестна'
+        print(f"   • {d_str} — {r['title_full']}")
+
+    # 5. Проходим по отсортированному списку и публикуем наиболее свежие
     new_posts = 0
     for release in new_releases:
         if new_posts >= MAX_POSTS_PER_RUN:
-            print(f"🛑 Достигнут лимит в {MAX_POSTS_PER_RUN} постов за запуск. Остановка.")
+            print(f"\n🛑 Достигнут лимит в {MAX_POSTS_PER_RUN} постов за запуск. Остановка.")
             break
 
-        print(f"\n🔍 Проверка даты для: {release['title_full']} (tralbum_id: {release.get('tralbum_id')})")
-        
-        release_date = fetch_release_date(release["link"])
+        print(f"\n🔍 Оценка публикации: {release['title_full']}")
+        rel_date = release.get("release_date")
 
-        if not is_release_date_valid(release_date):
+        if not is_release_date_valid(rel_date):
             continue
 
         print(f"🚀 Публикация в Telegram: {release['title_full']}")
