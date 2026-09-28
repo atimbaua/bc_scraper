@@ -4,6 +4,7 @@ import html
 import time
 import csv
 import re
+import random
 import urllib.parse
 from datetime import datetime, timezone, date
 import requests
@@ -25,32 +26,83 @@ TARGET_ARTISTS_AND_LABELS = [
     "https://sessionvictim.bandcamp.com"
 ]
 
-MAX_DAYS_AGO = 30        # Публиковать релизы не старше N дней
-ALLOW_UPCOMING = True    # Публиковать предзаказы / анонсы
+MAX_DAYS_AGO = 30
+ALLOW_UPCOMING = True
 
 MAX_POSTS_PER_RUN = 5
 POSTED_FILE = "posted_releases.json"
 CSV_FILE = "releases_data.csv"
 
+DEBUG_HTML = True                     # сохранять HTML неудачных страниц в debug_html/
+DEBUG_HTML_DIR = "debug_html"
+FETCH_RETRIES = 3                     # попыток на один URL
+
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "@bc_ambient")
+
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+]
 
 
 def get_headers():
     return {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "User-Agent": random.choice(USER_AGENTS),
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
     }
 
 
 def is_valid_html_response(text):
-    if not text or len(text) < 100:
+    """HTML считается валидным, только если содержит реальные маркеры страницы Bandcamp."""
+    if not text or len(text) < 500:
         return False
     low = text.lower()
-    if "just a moment" in low or "enable javascript" in low or "attention required" in low or "<title>access denied</title>" in low:
+    anti_bot = (
+        "just a moment", "enable javascript", "attention required",
+        "<title>access denied</title>", "cf-browser-verification",
+        "checking your browser", "please verify you are a human",
+        "ddos protection", "ray id",
+    )
+    if any(x in low for x in anti_bot):
+        return False
+    # Должен быть хотя бы один признак реальной страницы Bandcamp
+    bandcamp_markers = (
+        "data-tralbum", "bc-page-properties", "bcbits.com",
+        "bandcamp.com/", "tralbum-credits",
+    )
+    if not any(m in low for m in bandcamp_markers):
         return False
     return True
+
+
+def is_valid_json_response(text):
+    if not text or len(text) < 10:
+        return False
+    try:
+        json.loads(text)
+        return True
+    except Exception:
+        return False
+
+
+def _dump_html(url, text):
+    if not DEBUG_HTML:
+        return
+    try:
+        os.makedirs(DEBUG_HTML_DIR, exist_ok=True)
+        # имя файла из URL
+        safe = re.sub(r'[^a-zA-Z0-9]+', '_', url)[-120:]
+        path = os.path.join(DEBUG_HTML_DIR, f"{safe}.html")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text or "")
+    except Exception:
+        pass
 
 
 # ==============================================================================
@@ -101,22 +153,15 @@ def save_to_csv(details):
     with open(CSV_FILE, mode="a", encoding="utf-8", newline="") as f:
         writer = csv.writer(f)
         writer.writerow([
-            published_at_utc,
-            release_date_str,
-            genre,
-            artist,
-            album_title,
-            url,
-            tags,
-            image_url
+            published_at_utc, release_date_str, genre, artist,
+            album_title, url, tags, image_url
         ])
 
 
 # ==============================================================================
-# ПАРСИНГ ДАТЫ СО СТРАНИЦЫ РЕЛИЗА
+# ПАРСИНГ ДАТЫ
 # ==============================================================================
 def _strip_tags(text):
-    """Удаляет HTML-теги и нормализует пробелы. Полезно для regex-поиска по тексту."""
     if not text:
         return ""
     text = re.sub(r'<script[^>]*>.*?</script>', ' ', text, flags=re.I | re.S)
@@ -128,7 +173,6 @@ def _strip_tags(text):
 
 
 def _try_parse_date_string(d_str):
-    """Пытается распарсить дату из строки. Поддерживает множество форматов."""
     if not d_str:
         return None
 
@@ -136,17 +180,11 @@ def _try_parse_date_string(d_str):
     if not s:
         return None
 
-    # Убираем время и таймзону в разных вариантах:
-    #   '2026-09-26T00:00:00Z'  ->  '2026-09-26'
-    #   '26 Sep 2026 00:00:00 GMT' -> '26 Sep 2026'
-    #   '2026-09-26T00:00:00+00:00' -> '2026-09-26'
     s = re.sub(
         r'[T\s]\d{1,2}:\d{2}(:\d{2})?(\.\d+)?(Z|[+\-]\d{2}:?\d{2})?.*$',
-        '',
-        s
+        '', s
     ).strip()
-    s = s.rstrip('Z').strip()
-    s = s.rstrip(',').strip()
+    s = s.rstrip('Z').strip().rstrip(',').strip()
 
     formats = (
         "%d %b %Y", "%d %B %Y",
@@ -162,7 +200,6 @@ def _try_parse_date_string(d_str):
         except ValueError:
             pass
 
-    # Fallback: ищем подстроку с датой внутри произвольного текста
     for pat, fmts in (
         (r'(\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4})', ("%d %b %Y", "%d %B %Y")),
         (r'([A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4})', ("%B %d, %Y", "%b %d, %Y", "%B %d %Y", "%b %d %Y")),
@@ -176,14 +213,12 @@ def _try_parse_date_string(d_str):
                     return datetime.strptime(m.group(1), fmt).date()
                 except ValueError:
                     pass
-
     return None
 
 
 def _find_date_in_dict(d, keys=("release_date", "album_release_date",
                                 "original_release_date", "publish_date",
                                 "datePublished", "releaseDate")):
-    """Рекурсивно ищет дату в словаре/списке по заданным ключам."""
     if isinstance(d, dict):
         for k, v in d.items():
             if k in keys and v:
@@ -203,16 +238,10 @@ def _find_date_in_dict(d, keys=("release_date", "album_release_date",
 
 
 def parse_date_from_html(html_text):
-    """Извлекает дату релиза из HTML страницы Bandcamp.
-
-    Порядок проверок: от самых надёжных источников к самым хрупким.
-    """
     if not html_text:
         return None
 
-    # ------------------------------------------------------------------
-    # 1. data-tralbum (главный источник, есть практически всегда)
-    # ------------------------------------------------------------------
+    # 1. data-tralbum
     tralbum_match = re.search(r'data-tralbum=["\']([^"\']+)["\']', html_text)
     if tralbum_match:
         try:
@@ -223,13 +252,10 @@ def parse_date_from_html(html_text):
         except Exception:
             pass
 
-    # ------------------------------------------------------------------
-    # 2. JSON-LD (Schema.org MusicAlbum)
-    # ------------------------------------------------------------------
+    # 2. JSON-LD
     ld_matches = re.findall(
         r'<script[^>]*type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
-        html_text,
-        re.IGNORECASE | re.DOTALL
+        html_text, re.I | re.S
     )
     for ld_raw in ld_matches:
         try:
@@ -238,35 +264,30 @@ def parse_date_from_html(html_text):
             for item in items:
                 if not isinstance(item, dict):
                     continue
-                date_str = item.get("datePublished") or item.get("releaseDate")
-                if date_str:
-                    parsed = _try_parse_date_string(str(date_str))
-                    if parsed:
-                        return parsed
-                # иногда вложено в @graph
+                for key in ("datePublished", "releaseDate"):
+                    if item.get(key):
+                        parsed = _try_parse_date_string(str(item[key]))
+                        if parsed:
+                            return parsed
                 graph = item.get("@graph")
                 if isinstance(graph, list):
                     for g in graph:
                         if isinstance(g, dict):
-                            ds = g.get("datePublished") or g.get("releaseDate")
-                            if ds:
-                                parsed = _try_parse_date_string(str(ds))
-                                if parsed:
-                                    return parsed
+                            for key in ("datePublished", "releaseDate"):
+                                if g.get(key):
+                                    parsed = _try_parse_date_string(str(g[key]))
+                                    if parsed:
+                                        return parsed
         except Exception:
             pass
 
-    # ------------------------------------------------------------------
     # 3. <time datetime="...">
-    # ------------------------------------------------------------------
     for dt in re.findall(r'<time[^>]*datetime=["\']([^"\']+)["\']', html_text, re.I):
         parsed = _try_parse_date_string(dt)
         if parsed:
             return parsed
 
-    # ------------------------------------------------------------------
-    # 4. <meta name="bc-page-properties"> (JSON)
-    # ------------------------------------------------------------------
+    # 4. bc-page-properties
     props = re.search(
         r'<meta\s+name=["\']bc-page-properties["\']\s+content=["\']([^"\']+)["\']',
         html_text, re.I
@@ -280,9 +301,7 @@ def parse_date_from_html(html_text):
         except Exception:
             pass
 
-    # ------------------------------------------------------------------
-    # 5. Блок tralbum-credits (по тексту без тегов)
-    # ------------------------------------------------------------------
+    # 5. tralbum-credits
     credits = re.search(
         r'class=["\'][^"\']*tralbum-credits[^"\']*["\'][^>]*>(.*?)</div>',
         html_text, re.I | re.S
@@ -298,9 +317,7 @@ def parse_date_from_html(html_text):
             if parsed:
                 return parsed
 
-    # ------------------------------------------------------------------
-    # 6. og:description и meta[name=description]
-    # ------------------------------------------------------------------
+    # 6. og:description / meta description
     for meta_re in (
         r'<meta\s+property=["\']og:description["\']\s+content=["\']([^"\']+)["\']',
         r'<meta\s+name=["\']description["\']\s+content=["\']([^"\']+)["\']',
@@ -317,9 +334,7 @@ def parse_date_from_html(html_text):
                 if parsed:
                     return parsed
 
-    # ------------------------------------------------------------------
-    # 7. Общий regex по тексту без тегов ("released ...")
-    # ------------------------------------------------------------------
+    # 7. Общий regex по тексту
     text_only = _strip_tags(html_text)
     for pat in (
         r'released?\s+(?:on\s+)?([A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4})',
@@ -331,123 +346,154 @@ def parse_date_from_html(html_text):
             if parsed:
                 return parsed
 
-    # ------------------------------------------------------------------
-    # 8. itemprop="datePublished"
-    # ------------------------------------------------------------------
-    meta_dp = re.search(
+    # 8. itemprop datePublished
+    for pat in (
         r'itemprop=["\']datePublished["\'][^>]*content=["\']([^"\']+)["\']',
-        html_text, re.I
-    )
-    if meta_dp:
-        parsed = _try_parse_date_string(meta_dp.group(1))
-        if parsed:
-            return parsed
-    # обратный порядок атрибутов
-    meta_dp2 = re.search(
         r'content=["\']([^"\']+)["\'][^>]*itemprop=["\']datePublished["\']',
-        html_text, re.I
-    )
-    if meta_dp2:
-        parsed = _try_parse_date_string(meta_dp2.group(1))
-        if parsed:
-            return parsed
+    ):
+        m = re.search(pat, html_text, re.I)
+        if m:
+            parsed = _try_parse_date_string(m.group(1))
+            if parsed:
+                return parsed
 
-    # ------------------------------------------------------------------
-    # 9. JS-переменные (последний резерв)
-    # ------------------------------------------------------------------
-    for raw_date_str in re.findall(
+    # 9. JS-переменные
+    for raw in re.findall(
         r'(?:album_release_date|release_date|current_release_date|original_release_date)'
         r'"?\s*[:=]\s*"([^"]+)"',
         html_text, re.I
     ):
-        parsed = _try_parse_date_string(raw_date_str)
+        parsed = _try_parse_date_string(raw)
         if parsed:
             return parsed
 
     return None
 
 
-def _extract_ids_from_tralbum(html_text):
-    """Достаёт tralbum_id и band_id из data-tralbum для fallback через API."""
-    m = re.search(r'data-tralbum=["\']([^"\']+)["\']', html_text)
-    if not m:
-        return None, None
-    try:
-        tr = json.loads(html.unescape(m.group(1)))
-    except Exception:
-        return None, None
-
-    current = tr.get("current") or {}
-    tralbum_id = current.get("id") or tr.get("id")
-    band_id = current.get("band_id") or tr.get("band_id")
-    return tralbum_id, band_id
-
-
-def fetch_release_date_via_api(tralbum_id, band_id, tralbum_type="a"):
-    """Fallback: мобильное API Bandcamp, если HTML не отдал дату."""
-    if not tralbum_id or not band_id:
+# ==============================================================================
+# МОБИЛЬНОЕ API BANDCAMP (надёжнее HTML)
+# ==============================================================================
+def fetch_release_date_via_api(tralbum_id, band_id=None, band_name=None, tralbum_type="a"):
+    """Дата релиза через мобильное API Bandcamp. Работает без HTML."""
+    if not tralbum_id:
         return None
-    url = (
+
+    # Пробуем разные комбинации параметров
+    candidates = []
+    if band_id:
+        candidates.append(
+            f"https://bandcamp.com/api/mobile/24/tralbum_details"
+            f"?band_id={band_id}&tralbum_id={tralbum_id}&tralbum_type={tralbum_type}"
+        )
+    if band_name:
+        candidates.append(
+            f"https://bandcamp.com/api/mobile/24/tralbum_details"
+            f"?band_name={urllib.parse.quote(band_name)}&tralbum_id={tralbum_id}&tralbum_type={tralbum_type}"
+        )
+    candidates.append(
         f"https://bandcamp.com/api/mobile/24/tralbum_details"
-        f"?band_id={band_id}&tralbum_id={tralbum_id}&tralbum_type={tralbum_type}"
+        f"?tralbum_id={tralbum_id}&tralbum_type={tralbum_type}"
     )
-    try:
-        r = requests.get(url, headers=get_headers(), timeout=15)
-        if r.status_code != 200:
-            return None
-        data = r.json()
-        parsed = _find_date_in_dict(data)
-        if parsed:
-            return parsed
-    except Exception:
-        pass
+
+    for url in candidates:
+        try:
+            r = requests.get(url, headers=get_headers(), timeout=15)
+            if r.status_code != 200 or not is_valid_json_response(r.text):
+                continue
+            data = r.json()
+            parsed = _find_date_in_dict(data)
+            if parsed:
+                return parsed
+        except Exception:
+            continue
     return None
 
 
-def fetch_html(url, referer=None, timeout_html=30, timeout_req=20):
-    """Двухступенчатый fetch: curl_cffi → requests. Возвращает HTML или ''."""
+# ==============================================================================
+# ЗАГРУЗКА HTML С RETRY
+# ==============================================================================
+def fetch_html(url, referer=None, timeout=30, retries=FETCH_RETRIES):
     headers = get_headers()
     if referer:
         headers["Referer"] = referer
 
-    html_text = ""
+    last_status = None
+    last_len = 0
 
-    if CURL_CFFI_AVAILABLE:
+    for attempt in range(1, retries + 1):
+        # --- curl_cffi ---
+        if CURL_CFFI_AVAILABLE:
+            try:
+                res = curl_requests.get(
+                    url, headers=headers, impersonate="chrome120", timeout=timeout
+                )
+                last_status = res.status_code
+                last_len = len(res.text or "")
+                if res.status_code == 200 and is_valid_html_response(res.text):
+                    return res.text
+            except Exception as e:
+                print(f"   ⚠️ curl_cffi попытка {attempt}: {e}")
+
+        # --- requests ---
         try:
-            res = curl_requests.get(
-                url, headers=headers, impersonate="chrome120", timeout=timeout_html
-            )
+            res = requests.get(url, headers=headers, timeout=timeout)
+            last_status = res.status_code
+            last_len = len(res.text or "")
             if res.status_code == 200 and is_valid_html_response(res.text):
-                html_text = res.text
+                return res.text
         except Exception as e:
-            print(f"   ⚠️ curl_cffi: {e}")
+            print(f"   ⚠️ requests попытка {attempt}: {e}")
 
-    if not html_text:
-        try:
-            res = requests.get(url, headers=headers, timeout=timeout_req)
-            if res.status_code == 200 and is_valid_html_response(res.text):
-                html_text = res.text
-        except Exception as e:
-            print(f"   ⚠️ requests: {e}")
+        if attempt < retries:
+            pause = 2 ** attempt + random.uniform(0, 1)
+            print(f"   ↻ Повтор через {pause:.1f}с (status={last_status}, len={last_len})")
+            time.sleep(pause)
 
-    return html_text
+    print(f"   ❌ HTML не получен после {retries} попыток (last status={last_status}, len={last_len})")
+    if DEBUG_HTML:
+        _dump_html(url, "")  # сохраняем пустой файл как маркер, что страница не отдалась
+    return ""
 
 
-def fetch_release_date(url):
-    html_text = fetch_html(url)
-    if not html_text:
-        return None
+def fetch_release_date(release):
+    """Принимает словарь релиза. Возвращает date или None."""
+    url = release.get("link")
+    tralbum_id = release.get("tralbum_id")
+    band_id = release.get("band_id")
+    band_name = release.get("band_name")
 
-    parsed = parse_date_from_html(html_text)
-    if parsed:
-        return parsed
-
-    # Fallback: мобильное API
-    tralbum_id, band_id = _extract_ids_from_tralbum(html_text)
-    if tralbum_id and band_id:
-        parsed = fetch_release_date_via_api(tralbum_id, band_id)
+    # 1. Пробуем мобильное API (если есть ID)
+    if tralbum_id:
+        parsed = fetch_release_date_via_api(
+            tralbum_id, band_id=band_id, band_name=band_name
+        )
         if parsed:
             return parsed
+
+    # 2. Парсим HTML
+    html_text = fetch_html(url)
+    if html_text:
+        parsed = parse_date_from_html(html_text)
+        if parsed:
+            return parsed
+
+        # Fallback: если на HTML-странице нашли ID, но не нашли дату — пробуем API
+        m = re.search(r'data-tralbum=["\']([^"\']+)["\']', html_text)
+        if m:
+            try:
+                tr_json = json.loads(html.unescape(m.group(1)))
+                current = tr_json.get("current") or {}
+                tid = current.get("id") or tr_json.get("id")
+                bid = current.get("band_id") or tr_json.get("band_id")
+                if tid:
+                    parsed = fetch_release_date_via_api(tid, band_id=bid)
+                    if parsed:
+                        return parsed
+            except Exception:
+                pass
+    else:
+        if DEBUG_HTML:
+            _dump_html(url, "<EMPTY>")
 
     return None
 
@@ -473,7 +519,7 @@ def is_release_date_valid(release_date):
 
 
 # ==============================================================================
-# ПАРСИНГ ЖАНРОВ / ТЕГОВ BANDCAMP
+# ПАРСИНГ ЖАНРОВ / ТЕГОВ
 # ==============================================================================
 def fetch_from_genre(genre):
     genre_clean = genre.strip().lower().replace(" ", "-")
@@ -485,7 +531,7 @@ def fetch_from_genre(genre):
     seen_links = set()
 
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "User-Agent": random.choice(USER_AGENTS),
         "Accept": "application/json, text/javascript, */*; q=0.01",
         "Accept-Language": "en-US,en;q=0.9",
         "Referer": f"https://bandcamp.com/tag/{genre_clean}",
@@ -493,7 +539,6 @@ def fetch_from_genre(genre):
         "X-Requested-With": "XMLHttpRequest"
     }
 
-    # --- СПОСОБ 1: GET API Bandcamp Discover ---
     discover_urls = [
         f"https://bandcamp.com/api/discover/3/get_cards?g={genre_clean}&s=new&p=0&f=all",
         f"https://bandcamp.com/api/discover/3/get_cards?g={genre_clean}&s=top&p=0&f=all"
@@ -507,7 +552,7 @@ def fetch_from_genre(genre):
         if CURL_CFFI_AVAILABLE:
             try:
                 res = curl_requests.get(disc_url, headers=headers, impersonate="chrome120", timeout=20)
-                if res.status_code == 200 and is_valid_html_response(res.text):
+                if res.status_code == 200 and is_valid_json_response(res.text):
                     res_text = res.text
             except Exception:
                 pass
@@ -515,7 +560,7 @@ def fetch_from_genre(genre):
         if not res_text:
             try:
                 res = requests.get(disc_url, headers=headers, timeout=20)
-                if res.status_code == 200 and is_valid_html_response(res.text):
+                if res.status_code == 200 and is_valid_json_response(res.text):
                     res_text = res.text
             except Exception:
                 pass
@@ -529,6 +574,8 @@ def fetch_from_genre(genre):
                     title = card.get("primary_text") or card.get("title") or card.get("album_title")
                     artist = card.get("secondary_text") or card.get("artist_name") or card.get("artist") or "Неизвестный артист"
                     art_id = card.get("art_id") or card.get("image_id")
+                    tralbum_id = card.get("tralbum_id") or card.get("id")
+                    band_id = card.get("band_id")
 
                     if link:
                         full_link = link.split('?')[0]
@@ -543,21 +590,18 @@ def fetch_from_genre(genre):
                                 "description": f"New release in #{genre_clean}.",
                                 "tags": [genre_clean],
                                 "link": full_link,
-                                "genre": genre_clean
+                                "genre": genre_clean,
+                                "tralbum_id": tralbum_id,
+                                "band_id": band_id,
+                                "band_name": None,
                             })
             except Exception:
                 pass
 
-    # --- СПОСОБ 2: POST API Bandcamp Dig Deeper ---
     if not raw_items:
         api_url = "https://bandcamp.com/api/hub/2/dig_deeper"
         payload = {
-            "filters": {
-                "format": "all",
-                "location": 0,
-                "sort": "date",
-                "tag_slug": genre_clean
-            },
+            "filters": {"format": "all", "location": 0, "sort": "date", "tag_slug": genre_clean},
             "page": 1
         }
         post_headers = headers.copy()
@@ -567,15 +611,14 @@ def fetch_from_genre(genre):
         if CURL_CFFI_AVAILABLE:
             try:
                 res = curl_requests.post(api_url, json=payload, headers=post_headers, impersonate="chrome120", timeout=20)
-                if res.status_code == 200 and is_valid_html_response(res.text):
+                if res.status_code == 200 and is_valid_json_response(res.text):
                     res_text = res.text
             except Exception:
                 pass
-
         if not res_text:
             try:
                 res = requests.post(api_url, json=payload, headers=post_headers, timeout=20)
-                if res.status_code == 200 and is_valid_html_response(res.text):
+                if res.status_code == 200 and is_valid_json_response(res.text):
                     res_text = res.text
             except Exception:
                 pass
@@ -583,12 +626,13 @@ def fetch_from_genre(genre):
         if res_text:
             try:
                 data = json.loads(res_text)
-                items = data.get("items", [])
-                for item in items:
+                for item in data.get("items", []):
                     link = item.get("tralbum_url") or item.get("link") or item.get("url")
                     title = item.get("title")
                     artist = item.get("artist_name") or item.get("artist") or "Неизвестный артист"
                     art_id = item.get("art_id")
+                    tralbum_id = item.get("tralbum_id") or item.get("id")
+                    band_id = item.get("band_id")
 
                     if link:
                         full_link = link.split('?')[0]
@@ -603,33 +647,34 @@ def fetch_from_genre(genre):
                                 "description": f"New release in #{genre_clean}.",
                                 "tags": [genre_clean],
                                 "link": full_link,
-                                "genre": genre_clean
+                                "genre": genre_clean,
+                                "tralbum_id": tralbum_id,
+                                "band_id": band_id,
+                                "band_name": None,
                             })
             except Exception:
                 pass
 
-    # --- СПОСОБ 3: Парсинг HTML-страницы https://bandcamp.com/tag/<genre> ---
     if not raw_items:
         print(f"   ℹ️ Переход к резервному парсингу страницы https://bandcamp.com/tag/{genre_clean}...")
         tag_url = f"https://bandcamp.com/tag/{genre_clean}?sort_field=date"
         html_text = fetch_html(tag_url)
-
         if html_text:
             blob_match = re.search(r'data-blob="([^"]+)"', html_text)
             if blob_match:
                 try:
                     blob_json = json.loads(html.unescape(blob_match.group(1)))
                     hub_items = (blob_json.get("hub_data", {}).get("dig_deeper", {}).get("items", []) or
-                                   blob_json.get("tab_data", {}).get("dig_deeper", {}).get("items", []) or
-                                   blob_json.get("dig_deeper", {}).get("items", []) or
-                                   blob_json.get("items", []))
-
+                                 blob_json.get("tab_data", {}).get("dig_deeper", {}).get("items", []) or
+                                 blob_json.get("dig_deeper", {}).get("items", []) or
+                                 blob_json.get("items", []))
                     for item in hub_items:
                         link = item.get("tralbum_url") or item.get("link") or item.get("page_url")
                         title = item.get("title") or item.get("primary_text")
                         artist = item.get("artist_name") or item.get("artist") or item.get("secondary_text") or "Неизвестный артист"
                         art_id = item.get("art_id") or item.get("image_id")
-
+                        tralbum_id = item.get("tralbum_id") or item.get("id")
+                        band_id = item.get("band_id")
                         if link:
                             full_link = link.split('?')[0]
                             if full_link not in seen_links:
@@ -643,32 +688,13 @@ def fetch_from_genre(genre):
                                     "description": f"New release in #{genre_clean}.",
                                     "tags": [genre_clean],
                                     "link": full_link,
-                                    "genre": genre_clean
+                                    "genre": genre_clean,
+                                    "tralbum_id": tralbum_id,
+                                    "band_id": band_id,
+                                    "band_name": None,
                                 })
                 except Exception as e:
                     print(f"   ⚠️ Ошибка извлечения data-blob: {e}")
-
-            if not raw_items:
-                found_links = re.findall(
-                    r'https://[a-zA-Z0-9\-_]+\.bandcamp\.com/(?:album|track)/[a-zA-Z0-9\-_]+',
-                    html_text, re.IGNORECASE
-                )
-                for full_link in found_links:
-                    clean_link = full_link.split('?')[0]
-                    if clean_link not in seen_links:
-                        seen_links.add(clean_link)
-                        slug = clean_link.split("/")[-1]
-                        title_slug = slug.replace("-", " ").title()
-                        raw_items.append({
-                            "title_full": f"{title_slug}",
-                            "artist": "Various Artists",
-                            "album_title": title_slug,
-                            "image": "",
-                            "description": f"New release in #{genre_clean}.",
-                            "tags": [genre_clean],
-                            "link": clean_link,
-                            "genre": genre_clean
-                        })
 
     print(f"   Найдено релизов по жанру '{genre_clean}': {len(raw_items)}")
     return raw_items
@@ -685,32 +711,37 @@ def extract_subdomain(target):
     return target
 
 
+def _extract_band_id_from_artist_page(html_text):
+    """Пытается достать band_id из bc-page-properties или из data-* атрибутов."""
+    props = re.search(
+        r'<meta\s+name=["\']bc-page-properties["\']\s+content=["\']([^"\']+)["\']',
+        html_text, re.I
+    )
+    if props:
+        try:
+            pj = json.loads(html.unescape(props.group(1)))
+            if isinstance(pj, dict):
+                # Разные варианты ключа
+                for k in ("band_id", "item_id", "id"):
+                    if pj.get(k):
+                        return pj[k]
+        except Exception:
+            pass
+    m = re.search(r'band_id["\']?\s*[:=]\s*(\d+)', html_text)
+    if m:
+        return int(m.group(1))
+    return None
+
+
 def fetch_from_artist_or_label(target):
     subdomain = extract_subdomain(target)
     if not subdomain:
         return []
 
     url = f"https://{subdomain}.bandcamp.com/music"
-    headers = get_headers()
     print(f" 👤 [АРТИСТ/ЛЕЙБЛ]: Проверяем каталог {subdomain} ({url})...")
 
-    html_text = ""
-    if CURL_CFFI_AVAILABLE:
-        try:
-            res = curl_requests.get(url, headers=headers, impersonate="chrome120", timeout=30)
-            if res.status_code == 200 and is_valid_html_response(res.text):
-                html_text = res.text
-        except Exception as e:
-            print(f"   ⚠️ Ошибка запроса к артисту {subdomain} (curl_cffi): {e}")
-
-    if not html_text:
-        try:
-            res = requests.get(url, headers=headers, timeout=20)
-            if res.status_code == 200 and is_valid_html_response(res.text):
-                html_text = res.text
-        except Exception as e:
-            print(f"   ⚠️ Ошибка requests к артисту {subdomain}: {e}")
-
+    html_text = fetch_html(url)
     if not html_text:
         print(f"   ⚠️ Не удалось получить страницу артиста {subdomain}")
         return []
@@ -719,6 +750,8 @@ def fetch_from_artist_or_label(target):
     if not artist_match:
         artist_match = re.search(r'<title>([^<]+)</title>', html_text, re.IGNORECASE)
     artist_name = artist_match.group(1).split('|')[0].strip() if artist_match else subdomain
+
+    band_id = _extract_band_id_from_artist_page(html_text)
 
     releases_map = {}
 
@@ -731,6 +764,8 @@ def fetch_from_artist_or_label(target):
                 path = c_item.get("page_url") or c_item.get("title_link")
                 title = c_item.get("title")
                 art_id = c_item.get("art_id")
+                tralbum_id = c_item.get("id") or c_item.get("tralbum_id")
+                item_type = c_item.get("item_type") or ("track" if "/track/" in (path or "") else "album")
 
                 if path and title:
                     full_link = f"https://{subdomain}.bandcamp.com{path}" if path.startswith("/") else path
@@ -745,11 +780,15 @@ def fetch_from_artist_or_label(target):
                             "description": f"New release from {artist_name}.",
                             "tags": [subdomain],
                             "link": full_link,
-                            "genre": "artist/label"
+                            "genre": "artist/label",
+                            "tralbum_id": tralbum_id,
+                            "band_id": band_id,
+                            "band_name": subdomain,
                         }
         except Exception as e:
             print(f"   ⚠️ Ошибка чтения data-client-items: {e}")
 
+    # Дополнительные пути без ID (попадут в fallback через HTML)
     all_paths = re.findall(r'(?:href=["\']|\\?/)(/(?:album|track)/[a-zA-Z0-9\-_]+)', html_text, re.IGNORECASE)
     for path in all_paths:
         full_link = f"https://{subdomain}.bandcamp.com{path}".split('?')[0]
@@ -764,7 +803,10 @@ def fetch_from_artist_or_label(target):
                 "description": f"New release from {artist_name}.",
                 "tags": [subdomain],
                 "link": full_link,
-                "genre": "artist/label"
+                "genre": "artist/label",
+                "tralbum_id": None,
+                "band_id": band_id,
+                "band_name": subdomain,
             }
 
     js_paths = re.findall(r'"(?:page_url|title_link)"\s*:\s*"([^"]+)"', html_text)
@@ -783,16 +825,20 @@ def fetch_from_artist_or_label(target):
                     "description": f"New release from {artist_name}.",
                     "tags": [subdomain],
                     "link": full_link,
-                    "genre": "artist/label"
+                    "genre": "artist/label",
+                    "tralbum_id": None,
+                    "band_id": band_id,
+                    "band_name": subdomain,
                 }
 
     raw_items = list(releases_map.values())
-    print(f"   Найдено всего релизов в каталоге {artist_name}: {len(raw_items)}")
+    with_id = sum(1 for r in raw_items if r.get("tralbum_id"))
+    print(f"   Найдено релизов в каталоге {artist_name}: {len(raw_items)} (с tralbum_id: {with_id})")
     return raw_items
 
 
 # ==============================================================================
-# ОТПРАВКА В TELEGRAM
+# TELEGRAM
 # ==============================================================================
 def send_to_telegram(release):
     if not TELEGRAM_BOT_TOKEN:
@@ -855,6 +901,12 @@ def main():
         print("Ошибка: Не задан TELEGRAM_BOT_TOKEN")
         return
 
+    if CURL_CFFI_AVAILABLE:
+        print("✅ curl_cffi доступен — используем имперсонацию Chrome")
+    else:
+        print("⚠️ curl_cffi НЕ установлен — рекомендуется: pip install curl-cffi")
+        print("   Без него Bandcamp будет часто отдавать челлендж Cloudflare.")
+
     init_csv_file()
     posted = load_posted()
 
@@ -887,14 +939,15 @@ def main():
         return
 
     print(f"\n📅 Извлекаем фактические даты релизов для {len(new_releases)} релизов...")
-    for release in new_releases:
-        print(f"   🔎 Запрос даты: {release['title_full']}...")
-        release["release_date"] = fetch_release_date(release["link"])
+    for i, release in enumerate(new_releases, 1):
+        print(f"   🔎 [{i}/{len(new_releases)}] {release['title_full']}...")
+        release["release_date"] = fetch_release_date(release)
         if release["release_date"]:
-            print(f"      ✅ Найдена: {release['release_date']}")
+            print(f"      ✅ {release['release_date']}")
         else:
             print(f"      ❌ Не найдена")
-        time.sleep(1)
+        # Случайная пауза, чтобы не выглядеть как бот
+        time.sleep(random.uniform(2.0, 4.0))
 
     new_releases.sort(
         key=lambda x: x["release_date"] if x["release_date"] is not None else date.min,
