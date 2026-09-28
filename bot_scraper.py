@@ -26,7 +26,7 @@ GENRES = [
 TARGET_ARTISTS_AND_LABELS = [
     # "carbonbasedlifeforms",
     # "https://sessionvictim.bandcamp.com"
-    "https://jasonrobinson.bandcamp.com/"
+    "https://jasonrobinson.bandcamp.com"
 ]
 
 # 3. ФИЛЬТР ПО ВРЕМЕНИ ВЫПУСКА (в часах)
@@ -35,7 +35,7 @@ TARGET_ARTISTS_AND_LABELS = [
 # None или 0 = отключить фильтрацию по времени (постить всё старое)
 MAX_RELEASE_AGE_HOURS = 24   
 
-MAX_POSTS_PER_RUN = 20       # Лимит постов за 1 запуск
+MAX_POSTS_PER_RUN = 10       # Лимит постов за 1 запуск
 POSTED_FILE = "posted_releases.json"
 CSV_FILE = "releases_data.csv"
 
