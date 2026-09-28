@@ -19,7 +19,7 @@ except ImportError:
 # ==============================================================================
 # 1. Жанры для поиска
 GENRES = [
-    # "ambient"
+    "ambient"
 ]
 
 # 2. Артисты и лейблы для отслеживания
@@ -329,7 +329,7 @@ def parse_item_details(item, target_genre):
     }
 
 # ==============================================================================
-# ПАРСИНГ АРТИСТОВ / ЛЕЙБЛОВ
+# ПАРСИНГ АРТИСТОВ / ЛЕЙБЛОВ (С ГЛАВНОЙ СТРАНИЦЫ ДЛЯ ПОЛНОГО СПИСКА)
 # ==============================================================================
 def extract_subdomain(target):
     target = target.strip().lower()
@@ -343,9 +343,10 @@ def fetch_from_artist_or_label(target):
     if not subdomain:
         return []
 
-    url = f"https://{subdomain}.bandcamp.com/music"
+    # ИЗМЕНЕНИЕ: Запрашиваем главную страницу артиста/лейбла, а не /music
+    url = f"https://{subdomain}.bandcamp.com/"
     headers = get_headers()
-    print(f" 👤 [АРТИСТ/ЛЕЙБЛ]: Проверяем {subdomain} ({url})...")
+    print(f" 👤 [АРТИСТ/ЛЕЙБЛ]: Проверяем главную страницу {subdomain} ({url})...")
 
     html_text = ""
     if CURL_CFFI_AVAILABLE:
@@ -387,6 +388,7 @@ def fetch_from_artist_or_label(target):
     items = []
     seen_links = set()
 
+    # 1. Извлечение полного списка через JSON data-client-items на главной странице
     client_items_match = re.search(r'data-client-items="([^"]+)"', html_text)
     if client_items_match:
         try:
@@ -415,6 +417,7 @@ def fetch_from_artist_or_label(target):
         except Exception as e:
             print(f"   ⚠️ Не удалось распарсить data-client-items: {e}")
 
+    # 2. HTML фоллбэк по сетке карточек
     if not items:
         grid_li_blocks = re.findall(r'<li[^>]*class="[^"]*music-grid-item[^"]*"[^>]*>(.*?)</li>', html_text, re.DOTALL | re.IGNORECASE)
         for block in grid_li_blocks:
@@ -447,27 +450,6 @@ def fetch_from_artist_or_label(target):
                     "description": f"New release from {artist_name}.",
                     "tags": [subdomain],
                     "link": full_link,
-                    "genre": "artist/label"
-                })
-
-    if not items:
-        og_url = re.search(r'<meta\s+property="og:url"\s+content="([^"]+)"', html_text, re.IGNORECASE)
-        og_title = re.search(r'<meta\s+property="og:title"\s+content="([^"]+)"', html_text, re.IGNORECASE)
-        if og_url and og_title:
-            link = og_url.group(1).replace(".bandcamp.com/a/", ".bandcamp.com/album/").replace(".bandcamp.com/t/", ".bandcamp.com/track/")
-            if "/album/" in link or "/track/" in link:
-                title = html.unescape(og_title.group(1).strip())
-                og_img = re.search(r'<meta\s+property="og:image"\s+content="([^"]+)"', html_text, re.IGNORECASE)
-                img = og_img.group(1) if og_img else ""
-                
-                items.append({
-                    "title_full": f"{title} by {artist_name}",
-                    "artist": artist_name,
-                    "album_title": title,
-                    "image": img,
-                    "description": f"New release from {artist_name}.",
-                    "tags": [subdomain],
-                    "link": link,
                     "genre": "artist/label"
                 })
 
@@ -559,7 +541,7 @@ def main():
     new_releases = [r for r in releases if r["link"] not in posted]
     print(f"✨ Новых не опубликованных ранее релизов: {len(new_releases)}")
 
-    # Меняем порядок: начинаем проверку со свежих релизов (которые на странице Bandcamp идут первыми)
+    # Начинаем проверку со свежих релизов (идущих первыми на главной странице Bandcamp)
     new_releases = list(reversed(new_releases))
 
     new_posts = 0
