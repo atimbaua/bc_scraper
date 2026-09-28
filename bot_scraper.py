@@ -30,10 +30,10 @@ TARGET_ARTISTS_AND_LABELS = [
 # Например: 1 = искать только релизы за последний час
 # 24 = искать релизы за последние сутки
 # None или 0 = отключить фильтрацию по времени (постить всё подряд)
-MAX_RELEASE_AGE_HOURS = 4   
+MAX_RELEASE_AGE_HOURS = 24   
 
 # 4. Скорость и лимиты
-DISCOVER_ITEMS_LIMIT = 10   # Сколько первых (самых свежих) элементов из Discover API проверять
+DISCOVER_ITEMS_LIMIT = 5   # Сколько первых (самых свежих) элементов из Discover API проверять
 MAX_POSTS_PER_RUN = 3       # Лимит постов в Telegram за 1 запуск
 
 POSTED_FILE = "posted_releases.json"
