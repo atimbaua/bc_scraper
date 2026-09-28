@@ -9,6 +9,12 @@ from email.utils import parsedate_to_datetime
 import requests
 
 try:
+    from dateutil import parser as dateutil_parser
+    DATEUTIL_AVAILABLE = True
+except ImportError:
+    DATEUTIL_AVAILABLE = False
+
+try:
     from curl_cffi import requests as curl_requests
     CURL_CFFI_AVAILABLE = True
 except ImportError:
@@ -33,7 +39,7 @@ TARGET_ARTISTS_AND_LABELS = [
 MAX_RELEASE_AGE_HOURS = 24   
 
 # 4. Скорость и лимиты
-DISCOVER_ITEMS_LIMIT = 5   # Сколько первых (самых свежих) элементов из Discover API проверять
+DISCOVER_ITEMS_LIMIT = 10   # Сколько первых (самых свежих) элементов из Discover API проверять
 MAX_POSTS_PER_RUN = 3       # Лимит постов в Telegram за 1 запуск
 
 POSTED_FILE = "posted_releases.json"
@@ -54,6 +60,90 @@ def get_headers():
 # ==============================================================================
 # РАБОТА С ДАТАМИ И ВРЕМЕНЕМ
 # ==============================================================================
+def parse_datetime_str(val):
+    """Универсальный парсер для дат любого типа (timestamp, ISO, RFC, текста)."""
+    if not val:
+        return None
+
+    if isinstance(val, datetime):
+        if val.tzinfo is None:
+            return val.replace(tzinfo=timezone.utc)
+        return val
+
+    # Если целое число или float (timestamp)
+    if isinstance(val, (int, float)):
+        try:
+            ts = float(val)
+            if ts > 1e11:  # миллисекунды
+                ts /= 1000.0
+            return datetime.fromtimestamp(ts, tz=timezone.utc)
+        except Exception:
+            return None
+
+    val_str = str(val).strip()
+    if not val_str:
+        return None
+
+    # Если строка содержит только цифры (timestamp)
+    if val_str.isdigit():
+        try:
+            ts = float(val_str)
+            if ts > 1e11:
+                ts /= 1000.0
+            return datetime.fromtimestamp(ts, tz=timezone.utc)
+        except Exception:
+            pass
+
+    # 1. Попытка через dateutil.parser (если библиотека установлена)
+    if DATEUTIL_AVAILABLE:
+        try:
+            dt = dateutil_parser.parse(val_str)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt
+        except Exception:
+            pass
+
+    # 2. Попытка через email.utils (для RFC 2822 / Bandcamp GMT дат)
+    try:
+        dt = parsedate_to_datetime(val_str)
+        if dt:
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt
+    except Exception:
+        pass
+
+    # 3. Попытка через datetime.fromisoformat (для ISO 8601)
+    try:
+        clean_iso = val_str.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(clean_iso)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except Exception:
+        pass
+
+    # 4. Попытка через наиболее распространенные шаблоны strptime
+    formats = [
+        "%d %b %Y %H:%M:%S %Z",  # 20 Sep 2026 00:00:00 GMT
+        "%d %b %Y %H:%M:%S",
+        "%B %d, %Y",             # September 20, 2026
+        "%b %d, %Y",             # Sep 20, 2026
+        "%d %B %Y",              # 20 September 2026
+        "%Y%m%d",                # 20260920
+        "%Y-%m-%d",              # 2026-09-20
+        "%Y-%m-%d %H:%M:%S",
+    ]
+    for fmt in formats:
+        try:
+            dt = datetime.strptime(val_str, fmt)
+            return dt.replace(tzinfo=timezone.utc)
+        except Exception:
+            continue
+
+    return None
+
 def is_release_new(release_dt):
     """Проверяет, входит ли дата релиза в допустимое окно времени (MAX_RELEASE_AGE_HOURS)."""
     if not MAX_RELEASE_AGE_HOURS or MAX_RELEASE_AGE_HOURS <= 0:
@@ -96,37 +186,70 @@ def get_release_date_from_url(url):
     if not html_text:
         return None
 
-    # 1. Поиск datePublished / publish_date в JSON-LD
-    json_ld_match = re.search(r'"(?:datePublished|publish_date)":\s*"([^"]+)"', html_text)
-    if json_ld_match:
+    # 1. Поиск и разбор JSON-LD (schema.org)
+    json_ld_blocks = re.findall(
+        r'<script[^>]*type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
+        html_text,
+        re.DOTALL | re.IGNORECASE
+    )
+    for block in json_ld_blocks:
         try:
-            return parsedate_to_datetime(json_ld_match.group(1))
+            data = json.loads(block.strip())
+            items_to_check = data if isinstance(data, list) else [data]
+            for item in items_to_check:
+                if isinstance(item, dict):
+                    raw_date = (
+                        item.get("datePublished")
+                        or item.get("dateCreated")
+                        or item.get("dateModified")
+                        or item.get("releaseDate")
+                    )
+                    parsed = parse_datetime_str(raw_date)
+                    if parsed:
+                        return parsed
         except Exception:
             pass
 
-    # 2. Поиск JS-переменной publish_date в коде страницы (в формате ISO или RFC822)
-    js_date_match = re.search(r'publish_date:\s*"([^"]+)"', html_text)
-    if js_date_match:
-        try:
-            return parsedate_to_datetime(js_date_match.group(1))
-        except Exception:
-            pass
+    # 2. Поиск JS-переменных (TrAlbumData и другие объекты)
+    js_patterns = [
+        r'publish_date\s*:\s*["\']([^"\']+)["\']',
+        r'release_date\s*:\s*["\']([^"\']+)["\']',
+        r'album_release_date\s*:\s*["\']([^"\']+)["\']',
+        r'publish_date\s*:\s*(\d{10})',
+        r'release_date\s*:\s*(\d{10})'
+    ]
+    for pattern in js_patterns:
+        match = re.search(pattern, html_text)
+        if match:
+            parsed = parse_datetime_str(match.group(1))
+            if parsed:
+                return parsed
 
-    # 3. Поиск метатега itemprop="datePublished" content="20260928"
-    meta_match = re.search(r'itemprop="datePublished"\s+content="(\d{8})"', html_text)
-    if meta_match:
-        try:
-            return datetime.strptime(meta_match.group(1), "%Y%m%d").replace(tzinfo=timezone.utc)
-        except Exception:
-            pass
+    # 3. Поиск метатегов
+    meta_patterns = [
+        r'itemprop=["\']datePublished["\']\s+content=["\']([^"\']+)["\']',
+        r'content=["\']([^"\']+)["\']\s+itemprop=["\']datePublished["\']',
+        r'property=["\']music:release_date["\']\s+content=["\']([^"\']+)["\']',
+        r'name=["\']date["\']\s+content=["\']([^"\']+)["\']'
+    ]
+    for pattern in meta_patterns:
+        match = re.search(pattern, html_text, re.IGNORECASE)
+        if match:
+            parsed = parse_datetime_str(match.group(1))
+            if parsed:
+                return parsed
 
-    # 4. Поиск Unix Timestamp в JS-объектах (например, publish_date: 1770000000)
-    ts_match = re.search(r'publish_date:\s*(\d{10})', html_text)
-    if ts_match:
-        try:
-            return datetime.fromtimestamp(int(ts_match.group(1)), tz=timezone.utc)
-        except Exception:
-            pass
+    # 4. Поиск текстовых упоминаний даты релиза
+    text_patterns = [
+        r'released\s+([A-Za-z]+\s+\d{1,2},\s+\d{4})',
+        r'released\s+(\d{1,2}\s+[A-Za-z]+\s+\d{4})'
+    ]
+    for pattern in text_patterns:
+        match = re.search(pattern, html_text, re.IGNORECASE)
+        if match:
+            parsed = parse_datetime_str(match.group(1))
+            if parsed:
+                return parsed
 
     return None
 
@@ -260,14 +383,16 @@ def parse_item_details(item, target_genre, posted_set):
 
     # Извлечение даты
     release_dt = None
-    pub_timestamp = item.get("publish_date") or item.get("released") or item.get("publish_date_num")
-    if pub_timestamp:
-        try:
-            release_dt = datetime.fromtimestamp(int(pub_timestamp), tz=timezone.utc)
-        except Exception:
-            pass
+    pub_val = (
+        item.get("publish_date")
+        or item.get("released")
+        or item.get("publish_date_num")
+        or item.get("release_date")
+    )
+    if pub_val:
+        release_dt = parse_datetime_str(pub_val)
 
-    # Если в API даты не оказалось (стандартно для Bandcamp), загружаем её со страницы альбома
+    # Если в API даты не оказалось или распарсить не удалось, загружаем её со страницы
     if not release_dt:
         release_dt = get_release_date_from_url(link)
 
@@ -443,7 +568,7 @@ def main():
     releases = []
     seen_links = set()
 
-    # 1. Собираем релизы по жанрам (берём первые DISCOVER_ITEMS_LIMIT элементов)
+    # 1. Собираем релизы по жанрам
     for genre in GENRES:
         raw_items = fetch_from_discover_api(genre)
         for item in raw_items[:DISCOVER_ITEMS_LIMIT]:
@@ -495,3 +620,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+```eof
