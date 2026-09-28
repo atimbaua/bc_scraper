@@ -101,10 +101,6 @@ def save_to_csv(details):
 # ПАРСИНГ ДАТЫ СО СТРАНИЦЫ РЕЛИЗА
 # ==============================================================================
 def fetch_release_date(url):
-    """
-    Загружает HTML страницы релиза и ищет строку даты выхода:
-    "released September 27, 2026" или "releases June 15, 2027".
-    """
     headers = get_headers()
     html_text = ""
 
@@ -141,7 +137,6 @@ def fetch_release_date(url):
     if not html_text:
         return None
 
-    # Вариант 1: Поиск текста "released Month DD, YYYY" или "releases Month DD, YYYY"
     date_match = re.search(r'(?:released|releases)\s+([A-Za-z]+\s+\d{1,2},\s+\d{4})', html_text, re.IGNORECASE)
     if date_match:
         date_str = date_match.group(1).strip()
@@ -151,7 +146,6 @@ def fetch_release_date(url):
             except ValueError:
                 pass
 
-    # Вариант 2: Поиск текста "released DD Month YYYY"
     date_match_alt = re.search(r'(?:released|releases)\s+(\d{1,2}\s+[A-Za-z]+\s+\d{4})', html_text, re.IGNORECASE)
     if date_match_alt:
         date_str = date_match_alt.group(1).strip()
@@ -161,7 +155,6 @@ def fetch_release_date(url):
             except ValueError:
                 pass
 
-    # Вариант 3: Поиск datePublished в JSON-LD
     json_ld = re.search(r'"datePublished"\s*:\s*"([^"]+)"', html_text)
     if json_ld:
         raw_d = json_ld.group(1).strip()
@@ -329,7 +322,7 @@ def parse_item_details(item, target_genre):
     }
 
 # ==============================================================================
-# ПАРСИНГ АРТИСТОВ / ЛЕЙБЛОВ (С ГЛАВНОЙ СТРАНИЦЫ ДЛЯ ПОЛНОГО СПИСКА)
+# ПАРСИНГ АРТИСТОВ / ЛЕЙБЛОВ
 # ==============================================================================
 def extract_subdomain(target):
     target = target.strip().lower()
@@ -343,7 +336,6 @@ def fetch_from_artist_or_label(target):
     if not subdomain:
         return []
 
-    # ИЗМЕНЕНИЕ: Запрашиваем главную страницу артиста/лейбла, а не /music
     url = f"https://{subdomain}.bandcamp.com/"
     headers = get_headers()
     print(f" 👤 [АРТИСТ/ЛЕЙБЛ]: Проверяем главную страницу {subdomain} ({url})...")
@@ -388,7 +380,6 @@ def fetch_from_artist_or_label(target):
     items = []
     seen_links = set()
 
-    # 1. Извлечение полного списка через JSON data-client-items на главной странице
     client_items_match = re.search(r'data-client-items="([^"]+)"', html_text)
     if client_items_match:
         try:
@@ -417,7 +408,6 @@ def fetch_from_artist_or_label(target):
         except Exception as e:
             print(f"   ⚠️ Не удалось распарсить data-client-items: {e}")
 
-    # 2. HTML фоллбэк по сетке карточек
     if not items:
         grid_li_blocks = re.findall(r'<li[^>]*class="[^"]*music-grid-item[^"]*"[^>]*>(.*?)</li>', html_text, re.DOTALL | re.IGNORECASE)
         for block in grid_li_blocks:
@@ -452,6 +442,9 @@ def fetch_from_artist_or_label(target):
                     "link": full_link,
                     "genre": "artist/label"
                 })
+
+    # Разворачиваем сразу при получении, чтобы свежие релизы шли первыми
+    items = list(reversed(items))
 
     print(f"    Найдено релизов у {artist_name}: {len(items)}")
     return items
@@ -519,7 +512,6 @@ def main():
     releases = []
     seen_links = set()
 
-    # 1. Собираем релизы по жанрам
     for genre in GENRES:
         raw_items = fetch_from_discover_api(genre)
         for item in raw_items:
@@ -528,7 +520,6 @@ def main():
                 seen_links.add(details["link"])
                 releases.append(details)
 
-    # 2. Собираем релизы по артистам/лейблам
     for target in TARGET_ARTISTS_AND_LABELS:
         artist_items = fetch_from_artist_or_label(target)
         for details in artist_items:
@@ -540,9 +531,6 @@ def main():
 
     new_releases = [r for r in releases if r["link"] not in posted]
     print(f"✨ Новых не опубликованных ранее релизов: {len(new_releases)}")
-
-    # Начинаем проверку со свежих релизов (идущих первыми на главной странице Bandcamp)
-    new_releases = list(reversed(new_releases))
 
     new_posts = 0
     for release in new_releases:
