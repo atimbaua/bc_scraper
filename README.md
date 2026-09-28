@@ -1,19 +1,23 @@
-# Bandcamp Telegram Scraper Bot
+# Bandcamp Ambient Telegram Scraper Bot
 
-Автоматический Python-бот для поиска свежих музыкальных релизов на Bandcamp и их публикации в Telegram-канал. Жанр релиза устанавливается в переменной `GENRE`.
+Автоматический Python-бот для поиска и публикации свежих музыкальных релизов с **Bandcamp** в Telegram-канал. 
 
-Проект использует публичные и внутренние API Bandcamp, обходит защиту Cloudflare с помощью имитации TLS-отпечатка браузера (`curl_cffi`) и работает полностью бесплатно на базе **GitHub Actions**.
+Бот умеет отслеживать релизы как по **категориям/жанрам** (Ambient, Downtempo, Post-Rock и т.д.), так и по **конкретным артистам или лейблам** (например, Carbon Based Lifeforms, Ultimae Records).
+
+Проект использует внутренние API Bandcamp и прямой парсинг страниц, обходит защиту Cloudflare с помощью имитации TLS-отпечатка браузера (`curl_cffi`) и работает полностью бесплатно на базе **GitHub Actions**.
 
 ---
 
 ## Основные возможности
 
-- **Прямая работа с API Bandcamp:** Получение чистых JSON-данных без необходимости тяжелого парсинга HTML и рендеринга JS.
-- **Обход защиты Cloudflare:** Использование библиотеки `curl_cffi` с подменой TLS-fingerprint (Chrome 120) и каскадными фоллбэками (ScraperAPI, requests).
-- **Красивое оформление постов:** Публикация обложки альбома в высоком качестве (1000x1000 px), названия, артиста, автоматических хэштегов и прямой ссылки.
-- **Защита от повторных публикаций:** Сохранение истории отправленных релизов в `posted_releases.json`.
-- **Экспорт данных в CSV:** Накопление базы релизов (`releases_data.csv`) для последующей аналитики и визуализации (например, в Yandex DataLens).
-- **Лимитирование и автоматизация:** Публикация порциями (по умолчанию 5 релизов за запуск) каждый час по расписанию через GitHub Actions.
+* **Гибкий поиск по жанрам и артистам:** Поддержка списка жанров (`GENRES`) и конкретных поддоменов артистов/лейблов (`TARGET_ARTISTS_AND_LABELS`).
+* **Прямая работа с API и веб-страницами:** Получение данных через Discover API Bandcamp и прямая проверка страниц `/music` нужных артистов.
+* **Обход защиты Cloudflare:** Использование библиотеки `curl_cffi` с подменой TLS-fingerprint (Chrome 120) и каскадными фоллбэками.
+* **Автоматическая нормализация ссылок:** Преобразование алиасов Bandcamp (`/a/`, `/t/`) в канонические ссылки (`/album/`, `/track/`).
+* **Красивое оформление постов:** Публикация обложки альбома в высоком качестве, названия, артиста, автоматических хэштегов и прямой ссылки.
+* **Защита от дубликатов:** Сохранение истории отправленных релизов в `posted_releases.json`.
+* **Экспорт данных в CSV:** Накопление базы релизов (`releases_data.csv`) из 7 полей для последующего анализа и визуализации.
+* **Автоматизация:** Публикация порциями (по умолчанию 3 релиза за запуск) по расписанию через GitHub Actions.
 
 ---
 
@@ -23,7 +27,7 @@
 .
 ├── .github/
 │   └── workflows/
-│       └── scraper.yml       # Настройка расписания и запуска GitHub Actions
+│       └── scraper.yml       # Настройка расписания запускa GitHub Actions
 ├── bot_scraper.py            # Основной код парсера и Telegram-бота
 ├── posted_releases.json      # Список уже опубликованных ссылок (JSON)
 ├── releases_data.csv         # Накопленная база данных релизов (CSV)
@@ -33,9 +37,29 @@
 
 ---
 
+## Настройка бота (`bot_scraper.py`)
+
+В начале файла `bot_scraper.py` вы можете настроить критерии поиска:
+
+```python
+# 1. Жанры для поиска (можно указать один или несколько)
+GENRES = ["ambient", "downtempo"]
+
+# 2. Артисты и лейблы для отслеживания (указывайте поддомен или полную ссылку)
+TARGET_ARTISTS_AND_LABELS = [
+    "carbonbasedlifeforms",
+    "https://ultimae.bandcamp.com",
+    "solarfields"
+]
+
+MAX_POSTS_PER_RUN = 3       # Лимит постов за 1 запуск
+```
+
+---
+
 ## Переменные окружения (Secrets)
 
-Для работы бота требуется настроить следующие переменные окружения:
+Для работы бота в GitHub Actions или локально требуются следующие переменные окружения:
 
 | Переменная | Описание | Обязательна? |
 | :--- | :--- | :---: |
@@ -56,33 +80,30 @@
    ```
 
 2. **Настройте Secrets в GitHub:**
-   - Перейдите в **Settings** ➔ **Secrets and variables** ➔ **Actions**.
-   - Нажмите **New repository secret**.
-   - Добавьте `TELEGRAM_BOT_TOKEN` и `TELEGRAM_CHAT_ID`.
+   * Перейдите в **Settings** ➔ **Secrets and variables** ➔ **Actions**.
+   * Нажмите **New repository secret**.
+   * Добавьте `TELEGRAM_BOT_TOKEN` и `TELEGRAM_CHAT_ID`.
 
-3. **Включите Workflow:**
-   - Перейдите во вкладку **Actions**.
-   - Разрешите запуск workflows.
-   - Скрипт будет автоматически запускаться каждый час, а также вы можете запустить его вручную кнопкой **Run workflow**.
+3. **Запустите Workflow:**
+   * Перейдите во вкладку **Actions**.
+   * Бот будет запускаться каждый час по расписанию. Вы также можете запустить его вручную кнопкой **Run workflow**.
 
 ---
 
 ### Вариант 2. Локальный запуск или VPS
 
-1. **Клонируйте репозиторий и установите зависимости:**
+1. **Установите зависимости:**
    ```bash
-   git clone https://github.com/your-username/your-repo-name.git
-   cd your-repo-name
    pip install -r requirements.txt
    ```
 
 2. **Задайте переменные окружения:**
-   - **Linux / macOS:**
+   * **Linux / macOS:**
      ```bash
      export TELEGRAM_BOT_TOKEN="your_token_here"
      export TELEGRAM_CHAT_ID="@your_channel"
      ```
-   - **Windows (CMD / PowerShell):**
+   * **Windows (CMD / PowerShell):**
      ```cmd
      set TELEGRAM_BOT_TOKEN=your_token_here
      set TELEGRAM_CHAT_ID=@your_channel
@@ -95,34 +116,22 @@
 
 ---
 
-## Зависимости (`requirements.txt`)
+## Структура CSV-файла (`releases_data.csv`)
 
-Для работы парсера используются следующие пакеты:
-
-```text
-requests>=2.31.0
-beautifulsoup4>=4.12.0
-curl_cffi>=0.6.0
-```
-
----
-
-## Структура сохраняемого CSV-файла
-
-Скрипт ведет постоянный лог опубликованных альбомов в формате `releases_data.csv`:
+Все опубликованные релизы сохраняются в файле `releases_data.csv` со следующей структурой полей:
 
 | Поле | Описание | Пример |
 | :--- | :--- | :--- |
-| `published_at_utc` | Дата и время публикации (UTC) | `2026-03-30 12:00:15` |
-| `genre` | Категория / Жанр релиза | `ambient` |
-| `artist` | Исполнитель / Лейбл | `Joe Fujinoki` |
-| `album_title` | Название альбома/трека | `Glass Torso` |
-| `url` | Прямая ссылка на Bandcamp | `https://joefujinoki.bandcamp.com/album/glass-torso` |
-| `tags` | Теги релиза | `ambient, drone` |
+| `published_at_utc` | Дата и время публикации (UTC) | `2026-09-28 08:30:00` |
+| `genre` | Категория / Жанр релиза | `ambient` (или `artist/label`) |
+| `artist` | Исполнитель / Лейбл | `Carbon Based Lifeforms` |
+| `album_title` | Название альбома или трека | `World of Sleepers` |
+| `url` | Нормализованная ссылка | `https://carbonbasedlifeforms.bandcamp.com/album/world-of-sleepers` |
+| `tags` | Теги релиза | `ambient, downtempo` |
 | `image_url` | Прямая ссылка на обложку | `https://f4.bcbits.com/img/a1234567890_10.jpg` |
 
 ---
 
 ## Лицензия
 
-Проект распространяется под лицензией MIT.
+Проект распространяется под лицензией **MIT**.
