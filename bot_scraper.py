@@ -205,7 +205,103 @@ def is_release_date_valid(release_date):
         return is_ok
 
 # ==============================================================================
-# ПАРСИНГ АРТИСТОВ / ЛЕЙБЛОВ (ПОЛНЫЙ КАТАЛОГ)
+# ПАРСИНГ ЖАНРОВ / ТЕГОВ BANDCAMP
+# ==============================================================================
+def fetch_from_genre(genre):
+    genre_clean = genre.strip().lower().replace(" ", "-")
+    if not genre_clean:
+        return []
+
+    print(f" 🏷️ [ЖАНР]: Ищем релизы по жанру/тегу '{genre_clean}'...")
+    headers = get_headers()
+    raw_items = []
+    seen_links = set()
+
+    # 1. Запрос к официальному API Bandcamp Discover / Dig Deeper
+    api_url = "https://bandcamp.com/api/hub/2/dig_deeper"
+    payload = {
+        "filters": {
+            "format": "all",
+            "location": 0,
+            "sort": "date",  # Сортировка по свежим датам добавления
+            "tag_slug": genre_clean
+        },
+        "page": 1
+    }
+
+    try:
+        res = requests.post(api_url, json=payload, headers=headers, timeout=20)
+        if res.status_code == 200:
+            data = res.json()
+            items = data.get("items", [])
+            for item in items:
+                link = item.get("tralbum_url") or item.get("link") or item.get("url")
+                title = item.get("title")
+                artist = item.get("artist_name") or item.get("artist") or "Неизвестный артист"
+                art_id = item.get("art_id")
+
+                if link:
+                    full_link = link.split('?')[0]
+                    if full_link not in seen_links:
+                        seen_links.add(full_link)
+                        img_url = f"https://f4.bcbits.com/img/a{art_id}_10.jpg" if art_id else ""
+                        raw_items.append({
+                            "title_full": f"{title} by {artist}" if title else f"Release by {artist}",
+                            "artist": artist,
+                            "album_title": title or "Без названия",
+                            "image": img_url,
+                            "description": f"New release in #{genre_clean}.",
+                            "tags": [genre_clean],
+                            "link": full_link,
+                            "genre": genre_clean
+                        })
+    except Exception as e:
+        print(f"   ⚠️ Ошибка API при запросе жанра {genre_clean}: {e}")
+
+    # 2. Резервный HTML-парсинг страницы тега https://bandcamp.com/tag/<genre>
+    if not raw_items:
+        tag_url = f"https://bandcamp.com/tag/{genre_clean}?sort_field=date"
+        html_text = ""
+        if CURL_CFFI_AVAILABLE:
+            try:
+                res = curl_requests.get(tag_url, headers=headers, impersonate="chrome120", timeout=20)
+                if res.status_code == 200:
+                    html_text = res.text
+            except Exception:
+                pass
+
+        if not html_text:
+            try:
+                res = requests.get(tag_url, headers=headers, timeout=20)
+                if res.status_code == 200:
+                    html_text = res.text
+            except Exception:
+                pass
+
+        if html_text:
+            found_links = re.findall(r'href="(https?://[a-zA-Z0-9\-_]+\.bandcamp\.com/(?:album|track)/[a-zA-Z0-9\-_]+)"', html_text, re.IGNORECASE)
+            for full_link in found_links:
+                clean_link = full_link.split('?')[0]
+                if clean_link not in seen_links:
+                    seen_links.add(clean_link)
+                    slug = clean_link.split("/")[-1]
+                    title_slug = slug.replace("-", " ").title()
+                    raw_items.append({
+                        "title_full": f"{title_slug}",
+                        "artist": "Various Artists",
+                        "album_title": title_slug,
+                        "image": "",
+                        "description": f"New release in #{genre_clean}.",
+                        "tags": [genre_clean],
+                        "link": clean_link,
+                        "genre": genre_clean
+                    })
+
+    print(f"    Найдено релизов по жанру '{genre_clean}': {len(raw_items)}")
+    return raw_items
+
+# ==============================================================================
+# ПАРСИНГ АРТИСТОВ / ЛЕЙБЛОВ
 # ==============================================================================
 def extract_subdomain(target):
     target = target.strip().lower()
@@ -309,7 +405,7 @@ def fetch_from_artist_or_label(target):
                 "genre": "artist/label"
             }
 
-    # 3. Сбор из встроенных скриптов страницы (на случай динамических блоков)
+    # 3. Сбор из встроенных скриптов страницы
     js_paths = re.findall(r'"(?:page_url|title_link)"\s*:\s*"([^"]+)"', html_text)
     for path in js_paths:
         clean_path = path.replace("\\/", "/")
@@ -396,17 +492,27 @@ def main():
     releases = []
     seen_links = set()
 
-    # 1. Собираем все ссылки на релизы
+    # 1. Сбор по артистам и лейблам
     for target in TARGET_ARTISTS_AND_LABELS:
-        artist_items = fetch_from_artist_or_label(target)
-        for details in artist_items:
-            if details and details["link"] and details["link"] not in seen_links:
-                seen_links.add(details["link"])
-                releases.append(details)
+        if target.strip():
+            artist_items = fetch_from_artist_or_label(target)
+            for details in artist_items:
+                if details and details["link"] and details["link"] not in seen_links:
+                    seen_links.add(details["link"])
+                    releases.append(details)
+
+    # 2. Сбор по жанрам / тегам
+    for genre in GENRES:
+        if genre.strip():
+            genre_items = fetch_from_genre(genre)
+            for details in genre_items:
+                if details and details["link"] and details["link"] not in seen_links:
+                    seen_links.add(details["link"])
+                    releases.append(details)
 
     print(f"\n🔎 Всего распознано уникальных релизов: {len(releases)}")
 
-    # 2. Фильтруем те, что ещё не публиковались
+    # 3. Фильтруем те, что ещё не публиковались
     new_releases = [r for r in releases if r["link"] not in posted]
     print(f"✨ Не опубликованных ранее релизов: {len(new_releases)}")
 
@@ -414,14 +520,14 @@ def main():
         print("🏁 Нет новых релизов для обработки.")
         return
 
-    # 3. Извлекаем точные даты релиза для всех непостиченных альбомов
+    # 4. Извлекаем точные даты релиза для всех непостиченных альбомов
     print(f"\n📅 Извлекаем фактические даты релизов для {len(new_releases)} релизов...")
     for release in new_releases:
         print(f"   🔎 Запрос даты: {release['title_full']}...")
         release["release_date"] = fetch_release_date(release["link"])
         time.sleep(1)
 
-    # 4. Сортируем список релизов по дате (ОТ САМЫХ СВЕЖИХ К СТАРЫМ)
+    # 5. Сортируем список релизов по дате (ОТ САМЫХ СВЕЖИХ К СТАРЫМ)
     new_releases.sort(
         key=lambda x: x["release_date"] if x["release_date"] is not None else date.min,
         reverse=True
@@ -432,7 +538,7 @@ def main():
         d_str = r['release_date'].strftime('%Y-%m-%d') if r['release_date'] else 'Дата неизвестна'
         print(f"   • {d_str} — {r['title_full']}")
 
-    # 5. Проходим по отсортированному списку и публикуем наиболее свежие
+    # 6. Проходим по отсортированному списку и публикуем наиболее свежие
     new_posts = 0
     for release in new_releases:
         if new_posts >= MAX_POSTS_PER_RUN:
