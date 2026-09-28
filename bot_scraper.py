@@ -102,7 +102,8 @@ def _release_date_to_date(release_date_value):
       - None
       - строку "YYYY-MM-DD"
       - строку "DD Mon YYYY"
-      - объект с атрибутом .year/.month/.day (например, datetime или IsoDate)
+      - объект с атрибутами .year/.month/.day (pydantic IsoDate)
+      - datetime / date
     """
     if not release_date_value:
         return None
@@ -113,11 +114,8 @@ def _release_date_to_date(release_date_value):
     if isinstance(release_date_value, date):
         return release_date_value
 
-    # Если объект с year/month/day (например, pydantic IsoDate)
-    for attr in ("year", "month", "day"):
-        if not hasattr(release_date_value, attr):
-            break
-    else:
+    # Если объект с year/month/day (pydantic IsoDate)
+    if hasattr(release_date_value, "year") and hasattr(release_date_value, "month") and hasattr(release_date_value, "day"):
         try:
             return date(
                 int(release_date_value.year),
@@ -130,7 +128,7 @@ def _release_date_to_date(release_date_value):
     # Строковые форматы
     s = str(release_date_value).strip()
     for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%d %b %Y", "%d %B %Y",
-                "%B %d, %Y", "%b %d, %Y"):
+                "%B %d, %Y", "%b %d, %Y", "%B %d %Y", "%b %d %Y"):
         try:
             return datetime.strptime(s, fmt).date()
         except ValueError:
@@ -149,7 +147,12 @@ def _safe_get(obj, attr, default=None):
 # СБОР РЕЛИЗОВ ЧЕРЕЗ py_bandcamp
 # ==============================================================================
 def fetch_releases_from_artist(target):
-    """Собирает все релизы артиста/лейбла и извлекает даты через album_to_release."""
+    """Собирает все релизы артиста/лейбла и извлекает даты через album_to_release.
+
+    КЛЮЧЕВОЙ МОМЕНТ: в album_to_release передаётся album.url (строка),
+    а не объект BandcampAlbum. Это заставляет py_bandcamp загрузить
+    страницу релиза и извлечь оттуда дату.
+    """
     subdomain = extract_subdomain(target)
     if not subdomain:
         return []
@@ -184,10 +187,17 @@ def fetch_releases_from_artist(target):
 
     # 3. Каждый альбом -> Release (с датой)
     for album in albums:
+        # ВАЖНО: передаём URL (строку), а не объект album.
+        # Иначе страница релиза не загружается и release_date = None.
+        album_url = getattr(album, "url", None) or str(album)
+        if not album_url or not album_url.startswith("http"):
+            print(f"      ⚠️ Пропуск: нет URL у альбома {album!r}")
+            continue
+
         try:
-            release = BandCamp.album_to_release(album, include_tracklist=False)
+            release = BandCamp.album_to_release(album_url, include_tracklist=False)
         except Exception as e:
-            print(f"      ⚠️ album_to_release: {e}")
+            print(f"      ⚠️ album_to_release({album_url}): {e}")
             continue
 
         try:
@@ -207,7 +217,7 @@ def fetch_releases_from_artist(target):
 
             # Дата
             raw_date = _safe_get(release, "release_date")
-            if DEBUG and raw_date is not None:
+            if DEBUG:
                 print(f"      🔍 raw release_date = {raw_date!r} ({type(raw_date).__name__})")
 
             release_date = _release_date_to_date(raw_date)
@@ -246,8 +256,12 @@ def fetch_releases_from_genre(genre):
 
     try:
         for album in BandCamp.search_tag(genre_clean, albums=True, tracks=False, max_pages=2):
+            album_url = getattr(album, "url", None) or str(album)
+            if not album_url or not album_url.startswith("http"):
+                continue
+
             try:
-                release = BandCamp.album_to_release(album, include_tracklist=False)
+                release = BandCamp.album_to_release(album_url, include_tracklist=False)
             except Exception:
                 continue
 
