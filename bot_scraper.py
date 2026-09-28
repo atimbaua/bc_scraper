@@ -29,7 +29,7 @@ GENRES = ["ambient"]
 # 2. Артисты и лейблы для отслеживания (поддомен или полная ссылка)
 TARGET_ARTISTS_AND_LABELS = [
     # "carbonbasedlifeforms",
-    # "https://ultimae.bandcamp.com"
+    # "[https://ultimae.bandcamp.com](https://ultimae.bandcamp.com)"
 ]
 
 # 3. ФИЛЬТР ПО ВРЕМЕНИ ВЫПУСКА (в часах)
@@ -308,10 +308,10 @@ def save_to_csv(details):
 # ПАРСИНГ ЖАНРОВ (DISCOVER API)
 # ==============================================================================
 def fetch_from_discover_api(genre_name):
-    url = f"https://bandcamp.com/api/discover/3/get_web?g={genre_name}&s=date&p=0"
+    url = f"[https://bandcamp.com/api/discover/3/get_web?g=](https://bandcamp.com/api/discover/3/get_web?g=){genre_name}&s=date&p=0"
     headers = get_headers()
-    headers["Referer"] = f"https://bandcamp.com/tag/{genre_name}"
-    headers["Origin"] = "https://bandcamp.com"
+    headers["Referer"] = f"[https://bandcamp.com/tag/](https://bandcamp.com/tag/){genre_name}"
+    headers["Origin"] = "[https://bandcamp.com](https://bandcamp.com)"
     print(f"🎧 [ЖАНР]: Запрос к Discover API ({genre_name})...")
 
     if CURL_CFFI_AVAILABLE:
@@ -327,7 +327,7 @@ def fetch_from_discover_api(genre_name):
 
     if SCRAPERAPI_KEY:
         try:
-            scraper_url = f"http://api.scraperapi.com?api_key={SCRAPERAPI_KEY}&url={url}"
+            scraper_url = f"[http://api.scraperapi.com](http://api.scraperapi.com)?api_key={SCRAPERAPI_KEY}&url={url}"
             res = requests.get(scraper_url, headers=headers, timeout=40)
             if res.status_code == 200:
                 items = res.json().get("items", [])
@@ -359,14 +359,14 @@ def parse_item_details(item, target_genre, posted_set):
         raw_type = hints.get("item_type") or hints.get("type") or item.get("type")
         item_type = "album" if raw_type == "a" else ("track" if raw_type == "t" else "album")
         if subdomain and slug:
-            link = f"https://{subdomain}.bandcamp.com/{item_type}/{slug}"
+            link = f"https://{subdomain}[.bandcamp.com/](https://.bandcamp.com/){item_type}/{slug}"
 
     if not link and item.get("subdomain") and item.get("slug"):
         subdomain = item["subdomain"]
         slug = item["slug"]
         raw_type = item.get("type")
         item_type = "album" if raw_type == "a" else ("track" if raw_type == "t" else "album")
-        link = f"https://{subdomain}.bandcamp.com/{item_type}/{slug}"
+        link = f"https://{subdomain}[.bandcamp.com/](https://.bandcamp.com/){item_type}/{slug}"
 
     if not link:
         return None
@@ -374,8 +374,8 @@ def parse_item_details(item, target_genre, posted_set):
     if link.startswith("//"):
         link = "https:" + link
 
-    link = link.replace(".bandcamp.com/a/", ".bandcamp.com/album/")
-    link = link.replace(".bandcamp.com/t/", ".bandcamp.com/track/")
+    link = link.replace("[.bandcamp.com/a/](https://.bandcamp.com/a/)", "[.bandcamp.com/album/](https://.bandcamp.com/album/)")
+    link = link.replace("[.bandcamp.com/t/](https://.bandcamp.com/t/)", "[.bandcamp.com/track/](https://.bandcamp.com/track/)")
 
     # Быстрый пропуск: если уже был опубликован, лишний запрос даты не делаем
     if link in posted_set:
@@ -414,7 +414,7 @@ def parse_item_details(item, target_genre, posted_set):
     )
 
     art_id = item.get("art_id") or item.get("primary_art_id") or item.get("image_id")
-    image_url = f"https://f4.bcbits.com/img/a{art_id}_10.jpg" if art_id else ""
+    image_url = f"[https://f4.bcbits.com/img/a](https://f4.bcbits.com/img/a){art_id}_10.jpg" if art_id else ""
 
     genre_text = item.get("genre_text", target_genre)
     tags = [target_genre]
@@ -449,7 +449,7 @@ def fetch_from_artist_or_label(target, posted_set):
     if not subdomain:
         return []
 
-    url = f"https://{subdomain}.bandcamp.com/music"
+    url = f"https://{subdomain}[.bandcamp.com/music](https://.bandcamp.com/music)"
     headers = get_headers()
     print(f"👤 [АРТИСТ/ЛЕЙБЛ]: Проверяем {subdomain} ({url})...")
 
@@ -492,8 +492,8 @@ def fetch_from_artist_or_label(target, posted_set):
     for idx, (path, title) in enumerate(grid_items[:3]):
         clean_title = html.unescape(title.strip())
         full_link = f"https://{subdomain}.bandcamp.com{path}"
-        full_link = full_link.replace(".bandcamp.com/a/", ".bandcamp.com/album/")
-        full_link = full_link.replace(".bandcamp.com/t/", ".bandcamp.com/track/")
+        full_link = full_link.replace("[.bandcamp.com/a/](https://.bandcamp.com/a/)", "[.bandcamp.com/album/](https://.bandcamp.com/album/)")
+        full_link = full_link.replace("[.bandcamp.com/t/](https://.bandcamp.com/t/)", "[.bandcamp.com/track/](https://.bandcamp.com/track/)")
 
         if full_link in seen_links:
             continue
@@ -503,7 +503,7 @@ def fetch_from_artist_or_label(target, posted_set):
             continue
 
         release_dt = get_release_date_from_url(full_link)
-        img_url = f"https://f4.bcbits.com/img/a{art_ids[idx]}_10.jpg" if idx < len(art_ids) else ""
+        img_url = f"[https://f4.bcbits.com/img/a](https://f4.bcbits.com/img/a){art_ids[idx]}_10.jpg" if idx < len(art_ids) else ""
 
         items.append({
             "title_full": f"{clean_title} by {artist_name}",
@@ -525,7 +525,7 @@ def fetch_from_artist_or_label(target, posted_set):
 # ОТПРАВКА В TELEGRAM
 # ==============================================================================
 def send_to_telegram(release):
-    api_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
+    api_url = f"[https://api.telegram.org/bot](https://api.telegram.org/bot){TELEGRAM_BOT_TOKEN}/sendPhoto"
 
     title = html.escape(release["title_full"])
     desc = html.escape(release["description"])
@@ -620,4 +620,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-```eof
