@@ -19,7 +19,7 @@ except ImportError:
 # ==============================================================================
 # 1. Жанры для поиска
 GENRES = [
-    # "ambient"
+    "ambient"
 ]
 
 # 2. Артисты и лейблы для отслеживания
@@ -364,38 +364,66 @@ def fetch_from_artist_or_label(target):
         print(f"   ⚠️ Не удалось получить страницу артиста {subdomain}")
         return []
 
+    # Получаем имя артиста/лейбла
     artist_match = re.search(r'<meta\s+property="og:site_name"\s+content="([^"]+)"', html_text)
     if not artist_match:
         artist_match = re.search(r'<title>([^<]+)</title>', html_text)
     artist_name = artist_match.group(1).split('|')[0].strip() if artist_match else subdomain
 
     items = []
+
+    # 1. Поиск элементов сетки по классам
     grid_items = re.findall(
-        r'<a\s+href="(/(?:album|track|a|t)/[^"]+)"[^>]*>.*?<p\s+class="title"[^>]*>\s*([^<]+)\s*</p>',
+        r'<a\s+href="(/(?:album|track)/[^"?#]+)"[^>]*>.*?<(?:p|span)\s+class="title"[^>]*>\s*([^<]+)\s*</(?:p|span)>',
         html_text,
-        re.DOTALL
+        re.DOTALL | re.IGNORECASE
     )
 
+    # 2. Если элемента сетки по классам не нашлось, ищем любые ссылки на /album/ или /track/
+    if not grid_items:
+        raw_paths = re.findall(r'href="(/(?:album|track)/[a-zA-Z0-9\-_]+)"', html_text, re.IGNORECASE)
+        unique_paths = []
+        for p in raw_paths:
+            if p not in unique_paths:
+                unique_paths.append(p)
+
+        for path in unique_paths:
+            title_match = re.search(
+                r'href="' + re.escape(path) + r'"[^>]*>.*?<(?:p|span|div)[^>]*class="[^"]*title[^"]*"[^>]*>\s*([^<]+)\s*</',
+                html_text,
+                re.DOTALL | re.IGNORECASE
+            )
+            if title_match:
+                title_text = title_match.group(1).strip()
+            else:
+                title_text = path.split("/")[-1].replace("-", " ").title()
+            grid_items.append((path, title_text))
+
+    # 3. Резерв: Если сетка пуста, проверяем, не перенаправил ли Bandcamp сразу на единственный альбом
     if not grid_items:
         og_url = re.search(r'<meta\s+property="og:url"\s+content="([^"]+)"', html_text)
         og_title = re.search(r'<meta\s+property="og:title"\s+content="([^"]+)"', html_text)
         if og_url and og_title:
             link = og_url.group(1).replace(".bandcamp.com/a/", ".bandcamp.com/album/").replace(".bandcamp.com/t/", ".bandcamp.com/track/")
-            title = html.unescape(og_title.group(1).strip())
-            og_img = re.search(r'<meta\s+property="og:image"\s+content="([^"]+)"', html_text)
-            img = og_img.group(1) if og_img else ""
             
-            items.append({
-                "title_full": f"{title} by {artist_name}",
-                "artist": artist_name,
-                "album_title": title,
-                "image": img,
-                "description": f"New release from {artist_name}.",
-                "tags": [subdomain],
-                "link": link,
-                "genre": "artist/label"
-            })
-            return items
+            # ВАЖНО: Принимаем только если это прямая ссылка на альбом/трек, а не на страницу /music или корень
+            if "/album/" in link or "/track/" in link:
+                title = html.unescape(og_title.group(1).strip())
+                og_img = re.search(r'<meta\s+property="og:image"\s+content="([^"]+)"', html_text)
+                img = og_img.group(1) if og_img else ""
+                
+                items.append({
+                    "title_full": f"{title} by {artist_name}",
+                    "artist": artist_name,
+                    "album_title": title,
+                    "image": img,
+                    "description": f"New release from {artist_name}.",
+                    "tags": [subdomain],
+                    "link": link,
+                    "genre": "artist/label"
+                })
+                print(f"    Найдено релизов у {artist_name}: {len(items)}")
+                return items
 
     art_ids = re.findall(r'f4\.bcbits\.com/img/a(\d+)_\d+\.jpg', html_text)
 
@@ -405,6 +433,10 @@ def fetch_from_artist_or_label(target):
         full_link = f"https://{subdomain}.bandcamp.com{path}"
         full_link = full_link.replace(".bandcamp.com/a/", ".bandcamp.com/album/")
         full_link = full_link.replace(".bandcamp.com/t/", ".bandcamp.com/track/")
+
+        # Исключаем попадание ссылок на саму страницу лейбла
+        if "/album/" not in full_link and "/track/" not in full_link:
+            continue
 
         if full_link in seen_links:
             continue
