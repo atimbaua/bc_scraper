@@ -38,12 +38,13 @@ CSV_FILE = "releases_data.csv"
 
 DELAY_BETWEEN_RELEASES = (2.0, 4.0)
 DELAY_BETWEEN_PAGES = (3.0, 5.0)
-MAX_PAGES_PER_ARTIST = 30   # защита от бесконечного цикла
+MAX_PAGES_PER_ARTIST = 30          # защита от бесконечного цикла при пагинации
+SEARCH_MAX_PAGES = 10              # сколько страниц листать в search_albums fallback
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "@bc_ambient")
 
-DEBUG = True  # печатать raw release_date для каждого релиза
+DEBUG = True                       # печатать raw release_date для каждого релиза
 
 # ==============================================================================
 # ФАЙЛЫ
@@ -139,7 +140,7 @@ def _safe_get(obj, attr, default=None):
 def _release_from_album_obj(album, artist_name, subdomain):
     """Собирает словарь релиза из BandcampAlbum.
 
-    ВАЖНО: album_to_release получает URL строкой, чтобы py_bandcamp
+    Передаём URL строкой в album_to_release, чтобы py_bandcamp
     загрузил страницу релиза и извлёк release_date.
     """
     album_url = getattr(album, "url", None) or str(album)
@@ -183,42 +184,61 @@ def _release_from_album_obj(album, artist_name, subdomain):
     }
 
 
-# ==============================================================================
-# СБОР РЕЛИЗОВ С ОБХОДОМ ПАГИНАЦИИ /music?page=N
-# ==============================================================================
-def fetch_releases_from_artist(target):
-    """Собирает релизы со ВСЕХ страниц каталога артиста.
+def _release_from_release_obj(release, subdomain, default_artist="Various Artists"):
+    """Собирает словарь релиза из объекта Release (возвращается search_albums)."""
+    link = _safe_get(release, "uri")
+    if not link:
+        return None
 
-    Логика:
-      1. Идём по /music?page=1,2,3,...
-      2. На каждой странице парсим список альбомов через artist.albums
-      3. Сравниваем URL с уже собранными (seen_links)
-      4. Для новых вызываем album_to_release для получения даты
-      5. Если на странице нет новых ссылок — завершаем обход
+    title = "Без названия"
+    if release.work and release.work.title:
+        title = release.work.title
+
+    artist = default_artist
+    if release.work and release.work.credits:
+        try:
+            artist = release.work.credits[0].entity.name or default_artist
+        except Exception:
+            pass
+
+    release_date = _release_date_to_date(_safe_get(release, "release_date"))
+
+    return {
+        "title_full": f"{title} by {artist}",
+        "artist": artist,
+        "album_title": title,
+        "image": _safe_get(release, "image") or "",
+        "description": f"New release from {artist}.",
+        "tags": [subdomain],
+        "link": link,
+        "genre": "artist/label",
+        "release_date": release_date,
+    }
+
+
+# ==============================================================================
+# СБОР РЕЛИЗОВ — ЧАСТЬ 1: ПАГИНАЦИЯ /music?page=N
+# ==============================================================================
+def _crawl_music_pages(artist_base_url, subdomain):
+    """Обходит /music?page=N и возвращает список релизов.
+
+    Возвращает (releases, artist_name, seen_links).
     """
-    subdomain = extract_subdomain(target)
-    if not subdomain:
-        return []
-
-    artist_base_url = f"https://{subdomain}.bandcamp.com"
-    print(f" 👤 [АРТИСТ/ЛЕЙБЛ]: {subdomain} ({artist_base_url})...")
-
+    print(f"\n   ── Этап 1: обход /music?page=N ──")
     releases = []
     seen_links = set()
-    artist_name = subdomain  # временно, обновим после первого парсинга
+    artist_name = subdomain
 
     for page in range(1, MAX_PAGES_PER_ARTIST + 1):
         music_url = f"{artist_base_url}/music?page={page}"
         print(f"\n   📄 Страница {page}: {music_url}")
 
-        # 1. Парсим страницу каталога
         try:
             artist = BandcampArtist.from_url(music_url)
         except Exception as e:
             print(f"      ⚠️ Не удалось получить страницу {page}: {e}")
             break
 
-        # Имя артиста берём с первой успешной страницы
         if page == 1 and artist.name:
             artist_name = artist.name
             print(f"   Артист: {artist_name}")
@@ -235,14 +255,11 @@ def fetch_releases_from_artist(target):
 
         print(f"      Найдено на странице: {len(page_albums)}")
 
-        # 2. Обрабатываем каждый альбом
         new_on_page = 0
         for album in page_albums:
             album_url = getattr(album, "url", None) or str(album)
             if not album_url or album_url in seen_links:
                 continue
-
-            # Помечаем как seen сразу, чтобы не дублировать между страницами
             seen_links.add(album_url)
             new_on_page += 1
 
@@ -254,18 +271,95 @@ def fetch_releases_from_artist(target):
             print(f"      ✅ {release['album_title']} — "
                   f"{release['release_date'] or 'дата не указана'}")
 
-            # Пауза между релизами, чтобы не долбить Bandcamp
             time.sleep(random.uniform(*DELAY_BETWEEN_RELEASES))
 
-        # 3. Если новых ссылок не появилось — дальше пагинация бессмысленна
         if new_on_page == 0:
-            print(f"      🏁 На странице {page} нет новых релизов, завершаем обход.")
+            print(f"      🏁 На странице {page} нет новых релизов, завершаем пагинацию.")
             break
 
-        # Пауза между страницами
         time.sleep(random.uniform(*DELAY_BETWEEN_PAGES))
 
-    print(f"\n   Итого релизов у {artist_name}: {len(releases)}")
+    print(f"\n   Итого после пагинации: {len(releases)}")
+    return releases, artist_name, seen_links
+
+
+# ==============================================================================
+# СБОР РЕЛИЗОВ — ЧАСТЬ 2: FALLBACK ЧЕРЕЗ search_albums
+# ==============================================================================
+def _fallback_search_albums(artist_name, subdomain, seen_links):
+    """Добирает релизы через BandCamp.search_albums.
+
+    Возвращает список новых релизов (тех, которых не было в seen_links).
+    """
+    print(f"\n   ── Этап 2: fallback через search_albums ──")
+    releases = []
+    query = f"artist:{artist_name}"
+    print(f"   🔎 Поисковый запрос: {query!r}")
+
+    try:
+        results = BandCamp.search_albums(query, max_pages=SEARCH_MAX_PAGES)
+    except Exception as e:
+        print(f"      ⚠️ search_albums: {e}")
+        return releases
+
+    count_total = 0
+    count_new = 0
+    count_by_us = 0
+
+    for release in results:
+        count_total += 1
+        link = _safe_get(release, "uri")
+        if not link:
+            continue
+
+        # Отфильтровываем релизы других артистов: проверяем, что ссылка
+        # ведёт на поддомен нашего артиста.
+        if f"//{subdomain}.bandcamp.com/" not in link:
+            continue
+        count_by_us += 1
+
+        if link in seen_links:
+            continue
+        seen_links.add(link)
+        count_new += 1
+
+        new_release = _release_from_release_obj(release, subdomain, default_artist=artist_name)
+        if not new_release:
+            continue
+
+        releases.append(new_release)
+        print(f"      ✅ {new_release['album_title']} — "
+              f"{new_release['release_date'] or 'дата не указана'}")
+
+        time.sleep(random.uniform(*DELAY_BETWEEN_RELEASES))
+
+    print(f"   Всего из поиска: {count_total}, "
+          f"от нашего артиста: {count_by_us}, новых: {count_new}")
+    return releases
+
+
+# ==============================================================================
+# СБОР РЕЛИЗОВ С АРТИСТА/ЛЕЙБЛА (ОБА ЭТАПА)
+# ==============================================================================
+def fetch_releases_from_artist(target):
+    """Собирает все релизы артиста: пагинация + fallback через search_albums."""
+    subdomain = extract_subdomain(target)
+    if not subdomain:
+        return []
+
+    artist_base_url = f"https://{subdomain}.bandcamp.com"
+    print(f" 👤 [АРТИСТ/ЛЕЙБЛ]: {subdomain} ({artist_base_url})...")
+
+    # Этап 1: пагинация
+    releases, artist_name, seen_links = _crawl_music_pages(artist_base_url, subdomain)
+
+    # Этап 2: fallback через search_albums
+    fallback_releases = _fallback_search_albums(artist_name, subdomain, seen_links)
+    releases.extend(fallback_releases)
+
+    print(f"\n   ИТОГО релизов у {artist_name}: {len(releases)} "
+          f"(пагинация: {len(releases) - len(fallback_releases)}, "
+          f"поиск: {len(fallback_releases)})")
     return releases
 
 
@@ -429,7 +523,6 @@ def main():
         print("🏁 Нет новых релизов для обработки.")
         return
 
-    # Сортировка по дате (свежие сверху)
     new_releases.sort(
         key=lambda x: x["release_date"] if x["release_date"] is not None else date.min,
         reverse=True
@@ -440,7 +533,6 @@ def main():
         d = r['release_date'].strftime('%Y-%m-%d') if r['release_date'] else 'Дата неизвестна'
         print(f"   • {d} — {r['title_full']}")
 
-    # Публикация
     new_posts = 0
     for release in new_releases:
         if new_posts >= MAX_POSTS_PER_RUN:
