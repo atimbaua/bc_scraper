@@ -108,8 +108,26 @@ def parse_date_from_html(html_text):
     if not html_text:
         return None
 
-    # 1. Поиск "released Month DD, YYYY" или "releases Month DD, YYYY"
-    date_match = re.search(r'(?:released|releases)\s+([A-Za-z]+\s+\d{1,2},\s+\d{4})', html_text, re.IGNORECASE)
+    # Нормализуем HTML: заменяем переносы строк и спец-пробелы на обычные пробелы
+    clean_html = re.sub(r'\s+', ' ', html_text)
+
+    # 1. Поиск в JS-переменной TrAlbumData (Самый надежный способ на Bandcamp!)
+    # Пример: album_release_date: "26 Mar 2021 00:00:00 GMT" или release_date: "26 Mar 2021 ..."
+    tr_match = re.search(r'(?:album_release_date|release_date)"?\s*:\s*"([^"]+)"', clean_html, re.IGNORECASE)
+    if tr_match:
+        raw_date_str = tr_match.group(1).strip()
+        # Извлекаем подстроку даты вида "26 Mar 2021"
+        date_part = re.search(r'(\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4})', raw_date_str)
+        if date_part:
+            d_str = date_part.group(1)
+            for fmt in ("%d %b %Y", "%d %B %Y"):
+                try:
+                    return datetime.strptime(d_str, fmt).date()
+                except ValueError:
+                    pass
+
+    # 2. Поиск стандартного текста "released Month DD, YYYY" / "releases Month DD, YYYY"
+    date_match = re.search(r'(?:released|releases)\s+([A-Za-z]+\s+\d{1,2},\s+\d{4})', clean_html, re.IGNORECASE)
     if date_match:
         date_str = date_match.group(1).strip()
         for fmt in ("%B %d, %Y", "%b %d, %Y"):
@@ -118,8 +136,8 @@ def parse_date_from_html(html_text):
             except ValueError:
                 pass
 
-    # 2. Поиск "released DD Month YYYY" / "releases DD Month YYYY"
-    date_match_alt = re.search(r'(?:released|releases)\s+(\d{1,2}\s+[A-Za-z]+\s+\d{4})', html_text, re.IGNORECASE)
+    # 3. Поиск "released DD Month YYYY" / "releases DD Month YYYY"
+    date_match_alt = re.search(r'(?:released|releases)\s+(\d{1,2}\s+[A-Za-z]+\s+\d{4})', clean_html, re.IGNORECASE)
     if date_match_alt:
         date_str = date_match_alt.group(1).strip()
         for fmt in ("%d %B %Y", "%d %b %Y"):
@@ -128,8 +146,8 @@ def parse_date_from_html(html_text):
             except ValueError:
                 pass
 
-    # 3. Поиск itemprop="datePublished" content="YYYYMMDD" или "YYYY-MM-DD"
-    meta_dp = re.search(r'itemprop="datePublished"\s+content="(\d{8}|\d{4}-\d{2}-\d{2})"', html_text, re.IGNORECASE)
+    # 4. Поиск itemprop="datePublished" content="YYYYMMDD" или "YYYY-MM-DD"
+    meta_dp = re.search(r'itemprop="datePublished"\s+content="(\d{8}|\d{4}-\d{2}-\d{2})"', clean_html, re.IGNORECASE)
     if meta_dp:
         d_str = meta_dp.group(1).strip()
         if len(d_str) == 8:
@@ -143,8 +161,8 @@ def parse_date_from_html(html_text):
             except ValueError:
                 pass
 
-    # 4. Поиск datePublished / releaseDate в JSON-LD
-    json_ld = re.search(r'"(?:datePublished|releaseDate)"\s*:\s*"([^"]+)"', html_text, re.IGNORECASE)
+    # 5. Поиск datePublished / releaseDate в JSON-LD или метатегах
+    json_ld = re.search(r'"(?:datePublished|releaseDate)"\s*:\s*"([^"]+)"', clean_html, re.IGNORECASE)
     if json_ld:
         raw_d = json_ld.group(1).strip()
         try:
@@ -155,7 +173,7 @@ def parse_date_from_html(html_text):
             pass
 
     return None
-
+    
 def fetch_release_date(url):
     headers = get_headers()
     html_text = ""
