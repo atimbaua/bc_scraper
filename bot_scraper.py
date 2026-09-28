@@ -24,7 +24,7 @@ GENRES = [
 
 # 2. Артисты и лейблы для отслеживания
 TARGET_ARTISTS_AND_LABELS = [
-    "https://pitp.bandcamp.com"
+    "https://windyandcarl.bandcamp.com"
 ]
 
 # 3. Фильтрация по дате выхода релиза
