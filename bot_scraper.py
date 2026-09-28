@@ -25,7 +25,7 @@ TARGET_ARTISTS_AND_LABELS = [
     # "https://windyandcarl.bandcamp.com"
 ]
 
-MAX_DAYS_AGO = 1        # Публиковать релизы не старше N дней
+MAX_DAYS_AGO = 7        # Публиковать релизы не старше N дней
 ALLOW_UPCOMING = True    # Публиковать предзаказы / анонсы
 
 MAX_POSTS_PER_RUN = 5
