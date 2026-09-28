@@ -21,7 +21,7 @@ jobs:
 
       - name: Установка зависимостей
         run: |
-          pip install requests beautifulsoup4 curl_cffi
+          pip install requests beautifulsoup4 curl_cffi "py_bandcamp[stealth]"
 
       - name: Запуск автопостинга
         env:
