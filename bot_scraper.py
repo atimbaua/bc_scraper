@@ -104,14 +104,73 @@ def save_to_csv(details):
 # ==============================================================================
 # ПАРСИНГ ДАТЫ СО СТРАНИЦЫ РЕЛИЗА
 # ==============================================================================
+def _try_parse_date_string(d_str):
+    if not d_str:
+        return None
+    # Очищаем от времени (например, " 00:00:00 GMT" или "T00:00:00Z")
+    d_clean = re.sub(r'\s+\d{2}:\d{2}:\d{2}.*', '', d_str).strip()
+    d_clean = d_clean.replace("Z", "").strip()
+
+    formats = (
+        "%d %b %Y", "%d %B %Y",
+        "%B %d, %Y", "%b %d, %Y",
+        "%Y-%m-%d", "%Y/%m/%d"
+    )
+    for fmt in formats:
+        try:
+            return datetime.strptime(d_clean[:11].strip(), fmt).date()
+        except ValueError:
+            pass
+
+    # Поиск шаблона "DD Month YYYY" внутри строки
+    match_dmy = re.search(r'(\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4})', d_str)
+    if match_dmy:
+        sub_str = match_dmy.group(1)
+        for fmt in ("%d %b %Y", "%d %B %Y"):
+            try:
+                return datetime.strptime(sub_str, fmt).date()
+            except ValueError:
+                pass
+
+    # Поиск шаблона "Month DD, YYYY"
+    match_mdy = re.search(r'([A-Za-z]+\s+\d{1,2},\s+\d{4})', d_str)
+    if match_mdy:
+        sub_str = match_mdy.group(1)
+        for fmt in ("%B %d, %Y", "%b %d, %Y"):
+            try:
+                return datetime.strptime(sub_str, fmt).date()
+            except ValueError:
+                pass
+
+    return None
+
 def parse_date_from_html(html_text):
     if not html_text:
         return None
 
-    # Нормализуем HTML: заменяем переносы строк и спец-пробелы на обычные пробелы
     clean_html = re.sub(r'\s+', ' ', html_text)
 
-    # 0. Поиск в JSON-LD (<script type="application/ld+json">) — самый надежный способ Bandcamp
+    # 0. Поиск в атрибуте data-tralbum (Главный источник дат на Bandcamp альбомах/треках)
+    tralbum_attr_match = re.search(r'data-tralbum="([^"]+)"', html_text)
+    if tralbum_attr_match:
+        try:
+            tr_json = json.loads(html.unescape(tralbum_attr_match.group(1)))
+            # Проверяем ключи дат в корне и внутри словаря "current"
+            for key in ["release_date", "current_release_date", "original_release_date"]:
+                if key in tr_json and tr_json[key]:
+                    parsed = _try_parse_date_string(str(tr_json[key]))
+                    if parsed:
+                        return parsed
+            if "current" in tr_json and isinstance(tr_json["current"], dict):
+                for key in ["release_date", "current_release_date"]:
+                    if key in tr_json["current"] and tr_json["current"][key]:
+                        parsed = _try_parse_date_string(str(tr_json["current"][key]))
+                        if parsed:
+                            return parsed
+        except Exception:
+            pass
+
+    # 1. Поиск в JSON-LD (<script type="application/ld+json">)
     ld_matches = re.findall(
         r'<script[^>]*type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
         html_text,
@@ -120,72 +179,43 @@ def parse_date_from_html(html_text):
     for ld_raw in ld_matches:
         try:
             ld_data = json.loads(ld_raw.strip())
-            date_str = ld_data.get("datePublished") or ld_data.get("releaseDate")
-            if date_str:
-                if "T" in date_str:
-                    return datetime.fromisoformat(date_str.replace("Z", "+00:00")).date()
-                return datetime.strptime(date_str[:10], "%Y-%m-%d").date()
+            items = ld_data if isinstance(ld_data, list) else [ld_data]
+            for item in items:
+                date_str = item.get("datePublished") or item.get("releaseDate")
+                if date_str:
+                    parsed = _try_parse_date_string(str(date_str))
+                    if parsed:
+                        return parsed
         except Exception:
             pass
 
-    # 1. Поиск в JS-переменной TrAlbumData (Самый надежный способ на Bandcamp!)
-    tr_match = re.search(r'(?:album_release_date|release_date)"?\s*:\s*"([^"]+)"', clean_html, re.IGNORECASE)
-    if tr_match:
-        raw_date_str = tr_match.group(1).strip()
-        date_part = re.search(r'(\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4})', raw_date_str)
-        if date_part:
-            d_str = date_part.group(1)
-            for fmt in ("%d %b %Y", "%d %B %Y"):
-                try:
-                    return datetime.strptime(d_str, fmt).date()
-                except ValueError:
-                    pass
+    # 2. Поиск в JS-переменных TrAlbumData
+    tr_matches = re.findall(r'(?:album_release_date|release_date|current_release_date)"?\s*:\s*"([^"]+)"', clean_html, re.IGNORECASE)
+    for raw_date_str in tr_matches:
+        parsed = _try_parse_date_string(raw_date_str)
+        if parsed:
+            return parsed
 
-    # 2. Поиск стандартного текста "released Month DD, YYYY" / "releases Month DD, YYYY"
+    # 3. Поиск стандартного текста "released Month DD, YYYY" / "releases Month DD, YYYY"
     date_match = re.search(r'(?:released|releases)\s+([A-Za-z]+\s+\d{1,2},\s+\d{4})', clean_html, re.IGNORECASE)
     if date_match:
-        date_str = date_match.group(1).strip()
-        for fmt in ("%B %d, %Y", "%b %d, %Y"):
-            try:
-                return datetime.strptime(date_str, fmt).date()
-            except ValueError:
-                pass
+        parsed = _try_parse_date_string(date_match.group(1))
+        if parsed:
+            return parsed
 
-    # 3. Поиск "released DD Month YYYY" / "releases DD Month YYYY"
+    # 4. Поиск "released DD Month YYYY"
     date_match_alt = re.search(r'(?:released|releases)\s+(\d{1,2}\s+[A-Za-z]+\s+\d{4})', clean_html, re.IGNORECASE)
     if date_match_alt:
-        date_str = date_match_alt.group(1).strip()
-        for fmt in ("%d %B %Y", "%d %b %Y"):
-            try:
-                return datetime.strptime(date_str, fmt).date()
-            except ValueError:
-                pass
+        parsed = _try_parse_date_string(date_match_alt.group(1))
+        if parsed:
+            return parsed
 
-    # 4. Поиск itemprop="datePublished" content="YYYYMMDD" или "YYYY-MM-DD"
-    meta_dp = re.search(r'itemprop="datePublished"\s+content="(\d{8}|\d{4}-\d{2}-\d{2})"', clean_html, re.IGNORECASE)
+    # 5. Поиск itemprop="datePublished"
+    meta_dp = re.search(r'itemprop="datePublished"\s+content="([^"]+)"', clean_html, re.IGNORECASE)
     if meta_dp:
-        d_str = meta_dp.group(1).strip()
-        if len(d_str) == 8:
-            try:
-                return datetime.strptime(d_str, "%Y%m%d").date()
-            except ValueError:
-                pass
-        else:
-            try:
-                return datetime.strptime(d_str, "%Y-%m-%d").date()
-            except ValueError:
-                pass
-
-    # 5. Поиск datePublished / releaseDate в JSON-LD или метатегах
-    json_ld = re.search(r'"(?:datePublished|releaseDate)"\s*:\s*"([^"]+)"', clean_html, re.IGNORECASE)
-    if json_ld:
-        raw_d = json_ld.group(1).strip()
-        try:
-            if "T" in raw_d:
-                return datetime.fromisoformat(raw_d.replace("Z", "+00:00")).date()
-            return datetime.strptime(raw_d[:10], "%Y-%m-%d").date()
-        except Exception:
-            pass
+        parsed = _try_parse_date_string(meta_dp.group(1))
+        if parsed:
+            return parsed
 
     return None
     
