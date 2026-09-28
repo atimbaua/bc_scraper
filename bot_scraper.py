@@ -19,12 +19,12 @@ except ImportError:
 # ==============================================================================
 # 1. Жанры для поиска
 GENRES = [
-    "ambient"
+    # "ambient"
 ]
 
 # 2. Артисты и лейблы для отслеживания
 TARGET_ARTISTS_AND_LABELS = [
-    # "https://sessionvictim.bandcamp.com"
+    "https://pitp.bandcamp.com"
 ]
 
 # 3. Фильтрация по дате выхода релиза
