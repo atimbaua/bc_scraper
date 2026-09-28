@@ -17,7 +17,9 @@ except ImportError:
 # ==============================================================================
 # НАСТРОЙКИ
 # ==============================================================================
-GENRES = ["ambient"]
+GENRES = [
+    # "ambient"
+]
 
 TARGET_ARTISTS_AND_LABELS = [
     "https://windyandcarl.bandcamp.com"
