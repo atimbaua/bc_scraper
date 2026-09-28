@@ -1,4 +1,4 @@
-# Bandcamp Ambient Telegram Scraper Bot
+# Bandcamp Telegram Scraper Bot
 
 Автоматический Python-бот для поиска и публикации свежих музыкальных релизов с **Bandcamp** в Telegram-канал. 
 
