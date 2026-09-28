@@ -34,14 +34,21 @@ CSV_FILE = "releases_data.csv"
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "@bc_ambient")
-SCRAPERAPI_KEY = os.getenv("SCRAPERAPI_KEY")
 
 def get_headers():
     return {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
     }
+
+def is_valid_html_response(text):
+    if not text or len(text) < 100:
+        return False
+    low = text.lower()
+    if "just a moment" in low or "enable javascript" in low or "attention required" in low or "<title>access denied</title>" in low:
+        return False
+    return True
 
 # ==============================================================================
 # РАБОТА С ФАЙЛАМИ
@@ -151,32 +158,22 @@ def parse_date_from_html(html_text):
 
 def fetch_release_date(url):
     headers = get_headers()
-    headers["Accept"] = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
     html_text = ""
 
-    if SCRAPERAPI_KEY:
-        try:
-            clean_key = SCRAPERAPI_KEY.strip().strip('"').strip("'")
-            encoded_url = urllib.parse.quote(url, safe='')
-            scraper_url = f"http://api.scraperapi.com?api_key={clean_key}&url={encoded_url}"
-            res = requests.get(scraper_url, timeout=30)
-            if res.status_code == 200:
-                html_text = res.text
-        except Exception as e:
-            print(f"   ⚠️ Ошибка fetch_release_date (ScraperAPI): {e}")
-
-    if not html_text and CURL_CFFI_AVAILABLE:
+    # 1. Попытка через curl_cffi (обход Cloudflare)
+    if CURL_CFFI_AVAILABLE:
         try:
             res = curl_requests.get(url, headers=headers, impersonate="chrome120", timeout=30)
-            if res.status_code == 200:
+            if res.status_code == 200 and is_valid_html_response(res.text):
                 html_text = res.text
         except Exception as e:
             print(f"   ⚠️ Ошибка fetch_release_date (curl_cffi): {e}")
 
+    # 2. Резервная попытка через стандартный requests
     if not html_text:
         try:
             res = requests.get(url, headers=headers, timeout=20)
-            if res.status_code == 200:
+            if res.status_code == 200 and is_valid_html_response(res.text):
                 html_text = res.text
         except Exception as e:
             print(f"   ⚠️ Ошибка fetch_release_date (requests): {e}")
@@ -214,90 +211,141 @@ def fetch_from_genre(genre):
     raw_items = []
     seen_links = set()
 
-    headers = get_headers()
-    headers["Content-Type"] = "application/json"
-    headers["X-Requested-With"] = "XMLHttpRequest"
-
-    # 1. Попытка запроса к API Bandcamp (/api/hub/2/dig_deeper)
-    api_url = "https://bandcamp.com/api/hub/2/dig_deeper"
-    payload = {
-        "filters": {
-            "format": "all",
-            "location": 0,
-            "sort": "date",
-            "tag_slug": genre_clean
-        },
-        "page": 1
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": f"https://bandcamp.com/tag/{genre_clean}",
+        "Origin": "https://bandcamp.com",
+        "X-Requested-With": "XMLHttpRequest"
     }
 
-    res_text = ""
-    if CURL_CFFI_AVAILABLE:
-        try:
-            res = curl_requests.post(api_url, json=payload, headers=headers, impersonate="chrome120", timeout=20)
-            if res.status_code == 200:
-                res_text = res.text
-        except Exception:
-            pass
+    # --- СПОСОБ 1: GET API Bandcamp Discover ---
+    discover_urls = [
+        f"https://bandcamp.com/api/discover/3/get_cards?g={genre_clean}&s=new&p=0&f=all",
+        f"https://bandcamp.com/api/discover/3/get_cards?g={genre_clean}&s=top&p=0&f=all"
+    ]
 
-    if not res_text:
-        try:
-            res = requests.post(api_url, json=payload, headers=headers, timeout=20)
-            if res.status_code == 200:
-                res_text = res.text
-        except Exception:
-            pass
+    for disc_url in discover_urls:
+        if raw_items:
+            break
 
-    if res_text:
-        try:
-            data = json.loads(res_text)
-            items = data.get("items", [])
-            for item in items:
-                link = item.get("tralbum_url") or item.get("link") or item.get("url")
-                title = item.get("title")
-                artist = item.get("artist_name") or item.get("artist") or "Неизвестный артист"
-                art_id = item.get("art_id")
+        res_text = ""
+        if CURL_CFFI_AVAILABLE:
+            try:
+                res = curl_requests.get(disc_url, headers=headers, impersonate="chrome120", timeout=20)
+                if res.status_code == 200 and is_valid_html_response(res.text):
+                    res_text = res.text
+            except Exception:
+                pass
 
-                if link:
-                    full_link = link.split('?')[0]
-                    if full_link not in seen_links:
-                        seen_links.add(full_link)
-                        img_url = f"https://f4.bcbits.com/img/a{art_id}_10.jpg" if art_id else ""
-                        raw_items.append({
-                            "title_full": f"{title} by {artist}" if title else f"Release by {artist}",
-                            "artist": artist,
-                            "album_title": title or "Без названия",
-                            "image": img_url,
-                            "description": f"New release in #{genre_clean}.",
-                            "tags": [genre_clean],
-                            "link": full_link,
-                            "genre": genre_clean
-                        })
-        except Exception as e:
-            print(f"   ⚠️ Ошибка декодирования ответа API: {e}")
+        if not res_text:
+            try:
+                res = requests.get(disc_url, headers=headers, timeout=20)
+                if res.status_code == 200 and is_valid_html_response(res.text):
+                    res_text = res.text
+            except Exception:
+                pass
 
-    # 2. Резервный парсинг HTML/data-blob со страницы https://bandcamp.com/tag/<genre>
+        if res_text:
+            try:
+                data = json.loads(res_text)
+                cards = data.get("cards") or data.get("items") or []
+                for card in cards:
+                    link = card.get("tralbum_url") or card.get("page_url") or card.get("link") or card.get("url")
+                    title = card.get("primary_text") or card.get("title") or card.get("album_title")
+                    artist = card.get("secondary_text") or card.get("artist_name") or card.get("artist") or "Неизвестный артист"
+                    art_id = card.get("art_id") or card.get("image_id")
+
+                    if link:
+                        full_link = link.split('?')[0]
+                        if full_link not in seen_links:
+                            seen_links.add(full_link)
+                            img_url = f"https://f4.bcbits.com/img/a{art_id}_10.jpg" if art_id else ""
+                            raw_items.append({
+                                "title_full": f"{title} by {artist}" if title else f"Release by {artist}",
+                                "artist": artist,
+                                "album_title": title or "Без названия",
+                                "image": img_url,
+                                "description": f"New release in #{genre_clean}.",
+                                "tags": [genre_clean],
+                                "link": full_link,
+                                "genre": genre_clean
+                            })
+            except Exception:
+                pass
+
+    # --- СПОСОБ 2: POST API Bandcamp Dig Deeper ---
+    if not raw_items:
+        api_url = "https://bandcamp.com/api/hub/2/dig_deeper"
+        payload = {
+            "filters": {
+                "format": "all",
+                "location": 0,
+                "sort": "date",
+                "tag_slug": genre_clean
+            },
+            "page": 1
+        }
+        post_headers = headers.copy()
+        post_headers["Content-Type"] = "application/json"
+
+        res_text = ""
+        if CURL_CFFI_AVAILABLE:
+            try:
+                res = curl_requests.post(api_url, json=payload, headers=post_headers, impersonate="chrome120", timeout=20)
+                if res.status_code == 200 and is_valid_html_response(res.text):
+                    res_text = res.text
+            except Exception:
+                pass
+
+        if not res_text:
+            try:
+                res = requests.post(api_url, json=payload, headers=post_headers, timeout=20)
+                if res.status_code == 200 and is_valid_html_response(res.text):
+                    res_text = res.text
+            except Exception:
+                pass
+
+        if res_text:
+            try:
+                data = json.loads(res_text)
+                items = data.get("items", [])
+                for item in items:
+                    link = item.get("tralbum_url") or item.get("link") or item.get("url")
+                    title = item.get("title")
+                    artist = item.get("artist_name") or item.get("artist") or "Неизвестный артист"
+                    art_id = item.get("art_id")
+
+                    if link:
+                        full_link = link.split('?')[0]
+                        if full_link not in seen_links:
+                            seen_links.add(full_link)
+                            img_url = f"https://f4.bcbits.com/img/a{art_id}_10.jpg" if art_id else ""
+                            raw_items.append({
+                                "title_full": f"{title} by {artist}" if title else f"Release by {artist}",
+                                "artist": artist,
+                                "album_title": title or "Без названия",
+                                "image": img_url,
+                                "description": f"New release in #{genre_clean}.",
+                                "tags": [genre_clean],
+                                "link": full_link,
+                                "genre": genre_clean
+                            })
+            except Exception:
+                pass
+
+    # --- СПОСОБ 3: Парсинг HTML-страницы https://bandcamp.com/tag/<genre> ---
     if not raw_items:
         print(f"   ℹ️ Переход к резервному парсингу страницы https://bandcamp.com/tag/{genre_clean}...")
         tag_url = f"https://bandcamp.com/tag/{genre_clean}?sort_field=date"
         html_headers = get_headers()
-        html_headers["Accept"] = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
         html_text = ""
 
         if CURL_CFFI_AVAILABLE:
             try:
                 res = curl_requests.get(tag_url, headers=html_headers, impersonate="chrome120", timeout=20)
-                if res.status_code == 200:
-                    html_text = res.text
-            except Exception:
-                pass
-
-        if not html_text and SCRAPERAPI_KEY:
-            try:
-                clean_key = SCRAPERAPI_KEY.strip().strip('"').strip("'")
-                encoded_url = urllib.parse.quote(tag_url, safe='')
-                scraper_url = f"http://api.scraperapi.com?api_key={clean_key}&url={encoded_url}"
-                res = requests.get(scraper_url, timeout=30)
-                if res.status_code == 200:
+                if res.status_code == 200 and is_valid_html_response(res.text):
                     html_text = res.text
             except Exception:
                 pass
@@ -305,7 +353,7 @@ def fetch_from_genre(genre):
         if not html_text:
             try:
                 res = requests.get(tag_url, headers=html_headers, timeout=20)
-                if res.status_code == 200:
+                if res.status_code == 200 and is_valid_html_response(res.text):
                     html_text = res.text
             except Exception:
                 pass
@@ -315,19 +363,16 @@ def fetch_from_genre(genre):
             if blob_match:
                 try:
                     blob_json = json.loads(html.unescape(blob_match.group(1)))
-                    hub_items = (blob_json.get("hub_data", {})
-                                         .get("dig_deeper", {})
-                                         .get("items", []))
-                    if not hub_items:
-                        hub_items = (blob_json.get("tab_data", {})
-                                             .get("dig_deeper", {})
-                                             .get("items", []))
+                    hub_items = (blob_json.get("hub_data", {}).get("dig_deeper", {}).get("items", []) or
+                                 blob_json.get("tab_data", {}).get("dig_deeper", {}).get("items", []) or
+                                 blob_json.get("dig_deeper", {}).get("items", []) or
+                                 blob_json.get("items", []))
 
                     for item in hub_items:
-                        link = item.get("tralbum_url") or item.get("link")
-                        title = item.get("title")
-                        artist = item.get("artist_name") or item.get("artist") or "Неизвестный артист"
-                        art_id = item.get("art_id")
+                        link = item.get("tralbum_url") or item.get("link") or item.get("page_url")
+                        title = item.get("title") or item.get("primary_text")
+                        artist = item.get("artist_name") or item.get("artist") or item.get("secondary_text") or "Неизвестный артист"
+                        art_id = item.get("art_id") or item.get("image_id")
 
                         if link:
                             full_link = link.split('?')[0]
@@ -386,14 +431,13 @@ def fetch_from_artist_or_label(target):
 
     url = f"https://{subdomain}.bandcamp.com/music"
     headers = get_headers()
-    headers["Accept"] = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
     print(f" 👤 [АРТИСТ/ЛЕЙБЛ]: Проверяем каталог {subdomain} ({url})...")
 
     html_text = ""
     if CURL_CFFI_AVAILABLE:
         try:
             res = curl_requests.get(url, headers=headers, impersonate="chrome120", timeout=30)
-            if res.status_code == 200:
+            if res.status_code == 200 and is_valid_html_response(res.text):
                 html_text = res.text
         except Exception as e:
             print(f"   ⚠️ Ошибка запроса к артисту {subdomain} (curl_cffi): {e}")
@@ -401,21 +445,10 @@ def fetch_from_artist_or_label(target):
     if not html_text:
         try:
             res = requests.get(url, headers=headers, timeout=20)
-            if res.status_code == 200:
+            if res.status_code == 200 and is_valid_html_response(res.text):
                 html_text = res.text
         except Exception as e:
             print(f"   ⚠️ Ошибка requests к артисту {subdomain}: {e}")
-
-    if not html_text and SCRAPERAPI_KEY:
-        try:
-            clean_key = SCRAPERAPI_KEY.strip().strip('"').strip("'")
-            encoded_url = urllib.parse.quote(url, safe='')
-            scraper_url = f"http://api.scraperapi.com?api_key={clean_key}&url={encoded_url}"
-            res = requests.get(scraper_url, timeout=30)
-            if res.status_code == 200:
-                html_text = res.text
-        except Exception as e:
-            print(f"   ⚠️ Ошибка ScraperAPI к артисту {subdomain}: {e}")
 
     if not html_text:
         print(f"   ⚠️ Не удалось получить страницу артиста {subdomain}")
