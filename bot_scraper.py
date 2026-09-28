@@ -5,6 +5,7 @@ import csv
 import random
 import html as html_mod
 from datetime import datetime, timezone, date
+from urllib.parse import urljoin
 
 # ==============================================================================
 # НАСТРОЙКА ТРАНСПОРТА (обход Cloudflare/Fastly)
@@ -39,7 +40,7 @@ CSV_FILE = "releases_data.csv"
 DELAY_BETWEEN_RELEASES = (2.0, 4.0)
 DELAY_BETWEEN_PAGES = (3.0, 5.0)
 MAX_PAGES_PER_ARTIST = 30          # защита от бесконечного цикла при пагинации
-SEARCH_MAX_PAGES = 10              # сколько страниц листать в search_albums fallback
+SEARCH_MAX_RESULTS = 100           # ограничение на fallback-поиск
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "@bc_ambient")
@@ -137,14 +138,33 @@ def _safe_get(obj, attr, default=None):
         return default
 
 
-def _release_from_album_obj(album, artist_name, subdomain):
+def _absolute_album_url(album, base_url):
+    """Возвращает абсолютный URL страницы релиза.
+
+    album.url может быть относительным (/album/xxx) или абсолютным.
+    Соединяем с базовым доменом артиста (без ?page=N), чтобы не получить
+    мусор вида .../music?page=1/album/xxx.
+    """
+    raw = getattr(album, "url", None)
+    if not raw:
+        raw = str(album)
+    if not raw:
+        return None
+    if raw.startswith("http"):
+        return raw
+    # urljoin с базовым URL без завершающего слэша даст корректный абсолютный путь
+    return urljoin(base_url.rstrip("/") + "/", raw.lstrip("/"))
+
+
+def _release_from_album_obj(album, artist_name, subdomain, base_url):
     """Собирает словарь релиза из BandcampAlbum.
 
-    Передаём URL строкой в album_to_release, чтобы py_bandcamp
+    Передаём АБСОЛЮТНЫЙ URL строкой в album_to_release, чтобы py_bandcamp
     загрузил страницу релиза и извлёк release_date.
     """
-    album_url = getattr(album, "url", None) or str(album)
+    album_url = _absolute_album_url(album, base_url)
     if not album_url or not album_url.startswith("http"):
+        print(f"      ⚠️ Не удалось получить URL релиза: {album!r}")
         return None
 
     try:
@@ -257,13 +277,13 @@ def _crawl_music_pages(artist_base_url, subdomain):
 
         new_on_page = 0
         for album in page_albums:
-            album_url = getattr(album, "url", None) or str(album)
+            album_url = _absolute_album_url(album, artist_base_url)
             if not album_url or album_url in seen_links:
                 continue
             seen_links.add(album_url)
             new_on_page += 1
 
-            release = _release_from_album_obj(album, artist_name, subdomain)
+            release = _release_from_album_obj(album, artist_name, subdomain, artist_base_url)
             if not release:
                 continue
 
@@ -289,7 +309,8 @@ def _crawl_music_pages(artist_base_url, subdomain):
 def _fallback_search_albums(artist_name, subdomain, seen_links):
     """Добирает релизы через BandCamp.search_albums.
 
-    Возвращает список новых релизов (тех, которых не было в seen_links).
+    В текущей версии py_bandcamp search_albums не принимает max_pages,
+    поэтому просто итерируемся по результатам с ограничением SEARCH_MAX_RESULTS.
     """
     print(f"\n   ── Этап 2: fallback через search_albums ──")
     releases = []
@@ -297,7 +318,7 @@ def _fallback_search_albums(artist_name, subdomain, seen_links):
     print(f"   🔎 Поисковый запрос: {query!r}")
 
     try:
-        results = BandCamp.search_albums(query, max_pages=SEARCH_MAX_PAGES)
+        results = list(BandCamp.search_albums(query))
     except Exception as e:
         print(f"      ⚠️ search_albums: {e}")
         return releases
@@ -306,7 +327,7 @@ def _fallback_search_albums(artist_name, subdomain, seen_links):
     count_new = 0
     count_by_us = 0
 
-    for release in results:
+    for release in results[:SEARCH_MAX_RESULTS]:
         count_total += 1
         link = _safe_get(release, "uri")
         if not link:
@@ -375,7 +396,7 @@ def fetch_releases_from_genre(genre):
 
     try:
         for album in BandCamp.search_tag(genre_clean, albums=True, tracks=False, max_pages=2):
-            album_url = getattr(album, "url", None) or str(album)
+            album_url = _absolute_album_url(album, "https://bandcamp.com")
             if not album_url or not album_url.startswith("http"):
                 continue
             if album_url in seen_links:
