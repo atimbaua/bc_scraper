@@ -297,7 +297,7 @@ def fetch_from_artist_or_label(target):
     raw_items = []
     seen_links = set()
 
-    # 1. Извлекаем релизы из data-client-items
+    # 1. Извлечение релизов из data-client-items
     client_items_match = re.search(r'data-client-items="([^"]+)"', html_text)
     if client_items_match:
         try:
@@ -308,7 +308,6 @@ def fetch_from_artist_or_label(target):
                 title = c_item.get("title")
                 art_id = c_item.get("art_id")
                 
-                # Достаем id / item_id / tralbum_id
                 tralbum_id = c_item.get("id") or c_item.get("item_id") or c_item.get("tralbum_id") or 0
 
                 if path and title:
@@ -351,20 +350,20 @@ def fetch_from_artist_or_label(target):
                     "genre": "artist/label"
                 })
 
-    # 3. Гарантируем наличие tralbum_id у каждого релиза
+    # 3. Дополучаем tralbum_id, если он не был вытащен из data-client-items
     for item in raw_items:
         if item["tralbum_id"] == 0:
             item["tralbum_id"] = fetch_tralbum_id_fallback(item["link"])
 
-    # 4. СОБИРАЕМ ВСЕ tralbum_id В ОДИН МАССИВ И СОРТИРУЕМ ПО УБЫВАНИЮ
+    # 4. СОБИРАЕМ ВСЕ tralbum_id В МАССИВ И СОРТИРУЕМ ПО ВОЗРАСТАНИЮ
     tralbum_ids = [item["tralbum_id"] for item in raw_items if item["tralbum_id"] > 0]
-    tralbum_ids.sort(reverse=True)
+    tralbum_ids.sort(reverse=False)  # Сортировка по возрастанию (от меньших ID к большим)
 
-    print(f" 🔢 [TRALBUM_ID] Собран и отсортирован массив tralbum_id (по убыванию):")
+    print(f" 🔢 [TRALBUM_ID] Собран и отсортирован массив tralbum_id (по возрастанию):")
     print(f"    {tralbum_ids}")
 
-    # 5. СОРТИРУЕМ ВСЕ РЕЛИЗЫ НА ОСНОВЕ МАССИВА tralbum_id (ОТ НАИБОЛЬШЕГО К НАИМЕНЬШЕМУ)
-    raw_items.sort(key=lambda x: x["tralbum_id"], reverse=True)
+    # 5. СОРТИРУЕМ ВСЕ РЕЛИЗЫ ПО ВОЗРАСТАНИЮ TRALBUM_ID
+    raw_items.sort(key=lambda x: x["tralbum_id"], reverse=False)
 
     print(f"    Найдено ВСЕГО релизов у {artist_name}: {len(raw_items)}")
     return raw_items
@@ -432,7 +431,6 @@ def main():
     releases = []
     seen_links = set()
 
-    # 1. Собираем релизы по артистам/лейблам (они уже отсортированы по tralbum_id descending)
     for target in TARGET_ARTISTS_AND_LABELS:
         artist_items = fetch_from_artist_or_label(target)
         for details in artist_items:
