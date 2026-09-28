@@ -205,7 +205,7 @@ def is_release_date_valid(release_date):
         return is_ok
 
 # ==============================================================================
-# ПАРСИНГ АРТИСТОВ / ЛЕЙБЛОВ
+# ПАРСИНГ АРТИСТОВ / ЛЕЙБЛОВ (ПОЛНЫЙ КАТАЛОГ)
 # ==============================================================================
 def extract_subdomain(target):
     target = target.strip().lower()
@@ -260,10 +260,9 @@ def fetch_from_artist_or_label(target):
         artist_match = re.search(r'<title>([^<]+)</title>', html_text, re.IGNORECASE)
     artist_name = artist_match.group(1).split('|')[0].strip() if artist_match else subdomain
 
-    raw_items = []
-    seen_links = set()
+    releases_map = {}
 
-    # 1. Извлечение релизов из data-client-items
+    # 1. Сбор из data-client-items (JSON)
     client_items_match = re.search(r'data-client-items="([^"]+)"', html_text)
     if client_items_match:
         try:
@@ -276,11 +275,10 @@ def fetch_from_artist_or_label(target):
 
                 if path and title:
                     full_link = f"https://{subdomain}.bandcamp.com{path}" if path.startswith("/") else path
-                    full_link = full_link.replace(".bandcamp.com/a/", ".bandcamp.com/album/").replace(".bandcamp.com/t/", ".bandcamp.com/track/")
-                    if full_link not in seen_links and ("/album/" in full_link or "/track/" in full_link):
-                        seen_links.add(full_link)
+                    full_link = full_link.split('?')[0].replace(".bandcamp.com/a/", ".bandcamp.com/album/").replace(".bandcamp.com/t/", ".bandcamp.com/track/")
+                    if "/album/" in full_link or "/track/" in full_link:
                         img_url = f"https://f4.bcbits.com/img/a{art_id}_10.jpg" if art_id else ""
-                        raw_items.append({
+                        releases_map[full_link] = {
                             "title_full": f"{title} by {artist_name}",
                             "artist": artist_name,
                             "album_title": title,
@@ -289,19 +287,38 @@ def fetch_from_artist_or_label(target):
                             "tags": [subdomain],
                             "link": full_link,
                             "genre": "artist/label"
-                        })
+                        }
         except Exception as e:
             print(f"   ⚠️ Ошибка чтения data-client-items: {e}")
 
-    # 2. Запасной доступ через ссылки HTML
-    if not raw_items:
-        all_album_links = re.findall(r'href="(/(?:album|track)/[a-zA-Z0-9\-_]+)"', html_text, re.IGNORECASE)
-        for path in all_album_links:
-            full_link = f"https://{subdomain}.bandcamp.com{path}"
-            if full_link not in seen_links:
-                seen_links.add(full_link)
-                title_slug = path.split("/")[-1].replace("-", " ").title()
-                raw_items.append({
+    # 2. Сбор ВСЕХ ссылок из HTML-верстки (music-grid)
+    all_paths = re.findall(r'(?:href=["\']|\\?/)(/(?:album|track)/[a-zA-Z0-9\-_]+)', html_text, re.IGNORECASE)
+    for path in all_paths:
+        full_link = f"https://{subdomain}.bandcamp.com{path}".split('?')[0]
+        if full_link not in releases_map:
+            slug = path.split("/")[-1]
+            title_slug = slug.replace("-", " ").title()
+            releases_map[full_link] = {
+                "title_full": f"{title_slug} by {artist_name}",
+                "artist": artist_name,
+                "album_title": title_slug,
+                "image": "",
+                "description": f"New release from {artist_name}.",
+                "tags": [subdomain],
+                "link": full_link,
+                "genre": "artist/label"
+            }
+
+    # 3. Сбор из встроенных скриптов страницы (на случай динамических блоков)
+    js_paths = re.findall(r'"(?:page_url|title_link)"\s*:\s*"([^"]+)"', html_text)
+    for path in js_paths:
+        clean_path = path.replace("\\/", "/")
+        if clean_path.startswith("/") and ("/album/" in clean_path or "/track/" in clean_path):
+            full_link = f"https://{subdomain}.bandcamp.com{clean_path}".split('?')[0]
+            if full_link not in releases_map:
+                slug = clean_path.split("/")[-1]
+                title_slug = slug.replace("-", " ").title()
+                releases_map[full_link] = {
                     "title_full": f"{title_slug} by {artist_name}",
                     "artist": artist_name,
                     "album_title": title_slug,
@@ -310,8 +327,9 @@ def fetch_from_artist_or_label(target):
                     "tags": [subdomain],
                     "link": full_link,
                     "genre": "artist/label"
-                })
+                }
 
+    raw_items = list(releases_map.values())
     print(f"    Найдено всего релизов в каталоге {artist_name}: {len(raw_items)}")
     return raw_items
 
@@ -404,7 +422,6 @@ def main():
         time.sleep(1)
 
     # 4. Сортируем список релизов по дате (ОТ САМЫХ СВЕЖИХ К СТАРЫМ)
-    # Релизы без даты уйдут в самый конец списка (date.min)
     new_releases.sort(
         key=lambda x: x["release_date"] if x["release_date"] is not None else date.min,
         reverse=True
