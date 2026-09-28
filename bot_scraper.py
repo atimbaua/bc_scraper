@@ -24,7 +24,7 @@ GENRES = [
 # 2. Артисты и лейблы для отслеживания (указывайте поддомен или ссылку)
 # Примеры: "carbonbasedlifeforms", "https://ultimae.bandcamp.com", "solarfields"
 TARGET_ARTISTS_AND_LABELS = [
-    "https://sessionvictim.bandcamp.com"
+    # "https://sessionvictim.bandcamp.com"
 ]
 
 MAX_POSTS_PER_RUN = 3       # Лимит постов за 1 запуск
