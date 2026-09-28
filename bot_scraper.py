@@ -18,23 +18,24 @@ except ImportError:
 # НАСТРОЙКИ
 # ==============================================================================
 # 1. Жанры для поиска
-GENRES = [
-    "ambient"
-]
+GENRES = ["ambient"]
 
 # 2. Артисты и лейблы для отслеживания (поддомен или полная ссылка)
 TARGET_ARTISTS_AND_LABELS = [
     # "carbonbasedlifeforms",
-    # "https://sessionvictim.bandcamp.com"
+    # "https://ultimae.bandcamp.com"
 ]
 
 # 3. ФИЛЬТР ПО ВРЕМЕНИ ВЫПУСКА (в часах)
 # Например: 1 = искать только релизы за последний час
 # 24 = искать релизы за последние сутки
-# None или 0 = отключить фильтрацию по времени (постить всё старое)
-MAX_RELEASE_AGE_HOURS = 2
+# None или 0 = отключить фильтрацию по времени (постить всё подряд)
+MAX_RELEASE_AGE_HOURS = 4   
 
-MAX_POSTS_PER_RUN = 10       # Лимит постов за 1 запуск
+# 4. Скорость и лимиты
+DISCOVER_ITEMS_LIMIT = 10   # Сколько первых (самых свежих) элементов из Discover API проверять
+MAX_POSTS_PER_RUN = 3       # Лимит постов в Telegram за 1 запуск
+
 POSTED_FILE = "posted_releases.json"
 CSV_FILE = "releases_data.csv"
 
@@ -51,7 +52,7 @@ def get_headers():
     }
 
 # ==============================================================================
-# ПРОВЕРКА ВОЗРАСТА РЕЛИЗА
+# РАБОТА С ДАТАМИ И ВРЕМЕНЕМ
 # ==============================================================================
 def is_release_new(release_dt):
     """Проверяет, входит ли дата релиза в допустимое окно времени (MAX_RELEASE_AGE_HOURS)."""
@@ -59,19 +60,16 @@ def is_release_new(release_dt):
         return True  # Фильтр отключен
 
     if not release_dt:
-        # Если дату не удалось определить, пропускаем релиз во избежание постинга древнего архива
-        return False
+        return False  # Пропускаем, если дата так и не определилась
 
     now = datetime.now(timezone.utc)
     
-    # Приводим release_dt к UTC timezone, если зона не указана
     if release_dt.tzinfo is None:
         release_dt = release_dt.replace(tzinfo=timezone.utc)
 
     age_seconds = (now - release_dt).total_seconds()
     max_age_seconds = MAX_RELEASE_AGE_HOURS * 3600
 
-    # Разрешаем релизы, которые вышли не раньше чем MAX_RELEASE_AGE_HOURS
     return 0 <= age_seconds <= max_age_seconds
 
 def get_release_date_from_url(url):
@@ -81,7 +79,7 @@ def get_release_date_from_url(url):
 
     if CURL_CFFI_AVAILABLE:
         try:
-            res = curl_requests.get(url, headers=headers, impersonate="chrome120", timeout=20)
+            res = curl_requests.get(url, headers=headers, impersonate="chrome120", timeout=15)
             if res.status_code == 200:
                 html_text = res.text
         except Exception:
@@ -98,15 +96,23 @@ def get_release_date_from_url(url):
     if not html_text:
         return None
 
-    # 1. Ищем datePublished в JSON-LD ("datePublished": "28 Sep 2026 00:00:00 GMT")
-    match = re.search(r'"datePublished":\s*"([^"]+)"', html_text)
-    if match:
+    # 1. Поиск datePublished / publish_date в JSON-LD
+    json_ld_match = re.search(r'"(?:datePublished|publish_date)":\s*"([^"]+)"', html_text)
+    if json_ld_match:
         try:
-            return parsedate_to_datetime(match.group(1))
+            return parsedate_to_datetime(json_ld_match.group(1))
         except Exception:
             pass
 
-    # 2. Ищем метатег itemprop="datePublished" content="20260928"
+    # 2. Поиск JS-переменной publish_date в коде страницы (в формате ISO или RFC822)
+    js_date_match = re.search(r'publish_date:\s*"([^"]+)"', html_text)
+    if js_date_match:
+        try:
+            return parsedate_to_datetime(js_date_match.group(1))
+        except Exception:
+            pass
+
+    # 3. Поиск метатега itemprop="datePublished" content="20260928"
     meta_match = re.search(r'itemprop="datePublished"\s+content="(\d{8})"', html_text)
     if meta_match:
         try:
@@ -114,10 +120,18 @@ def get_release_date_from_url(url):
         except Exception:
             pass
 
+    # 4. Поиск Unix Timestamp в JS-объектах (например, publish_date: 1770000000)
+    ts_match = re.search(r'publish_date:\s*(\d{10})', html_text)
+    if ts_match:
+        try:
+            return datetime.fromtimestamp(int(ts_match.group(1)), tz=timezone.utc)
+        except Exception:
+            pass
+
     return None
 
 # ==============================================================================
-# РАБОТА С ССЫЛКАМИ И ФАЙЛАМИ (JSON & CSV)
+# РАБОТА С ХРАНИЛИЩАМИ (JSON & CSV)
 # ==============================================================================
 def init_csv_file():
     if not os.path.exists(CSV_FILE):
@@ -175,7 +189,7 @@ def fetch_from_discover_api(genre_name):
     headers = get_headers()
     headers["Referer"] = f"https://bandcamp.com/tag/{genre_name}"
     headers["Origin"] = "https://bandcamp.com"
-    print(f" 🎧 [ЖАНР]: Пробуем Discover API ({genre_name})...")
+    print(f"🎧 [ЖАНР]: Запрос к Discover API ({genre_name})...")
 
     if CURL_CFFI_AVAILABLE:
         try:
@@ -183,7 +197,7 @@ def fetch_from_discover_api(genre_name):
             if res.status_code == 200:
                 items = res.json().get("items", [])
                 if items:
-                    print(f"    Успех Discover API! Найдено релизов: {len(items)}")
+                    print(f"    Успешно получен список. Найдено релизов: {len(items)}")
                     return items
         except Exception as e:
             print(f"   ⚠️ Ошибка Discover API (curl_cffi): {e}")
@@ -195,18 +209,18 @@ def fetch_from_discover_api(genre_name):
             if res.status_code == 200:
                 items = res.json().get("items", [])
                 if items:
-                    print(f"    Успех Discover API (ScraperAPI)! Найдено релизов: {len(items)}")
+                    print(f"    Успешно через ScraperAPI! Найдено релизов: {len(items)}")
                     return items
         except Exception as e:
             print(f"   ⚠️ Ошибка Discover API (ScraperAPI): {e}")
 
     return []
 
-def parse_item_details(item, target_genre):
+def parse_item_details(item, target_genre, posted_set):
     if not isinstance(item, dict):
         return None
 
-    # Извлечение ссылки
+    # Формирование нормализованной ссылки
     link = (
         item.get("tralbum_url")
         or item.get("item_url")
@@ -240,14 +254,22 @@ def parse_item_details(item, target_genre):
     link = link.replace(".bandcamp.com/a/", ".bandcamp.com/album/")
     link = link.replace(".bandcamp.com/t/", ".bandcamp.com/track/")
 
-    # Определение даты публикации из API (в сек.)
+    # Быстрый пропуск: если уже был опубликован, лишний запрос даты не делаем
+    if link in posted_set:
+        return {"link": link, "already_posted": True}
+
+    # Извлечение даты
     release_dt = None
-    pub_timestamp = item.get("publish_date") or item.get("released")
+    pub_timestamp = item.get("publish_date") or item.get("released") or item.get("publish_date_num")
     if pub_timestamp:
         try:
             release_dt = datetime.fromtimestamp(int(pub_timestamp), tz=timezone.utc)
         except Exception:
             pass
+
+    # Если в API даты не оказалось (стандартно для Bandcamp), загружаем её со страницы альбома
+    if not release_dt:
+        release_dt = get_release_date_from_url(link)
 
     artist = (
         item.get("band_name")
@@ -283,7 +305,8 @@ def parse_item_details(item, target_genre):
         "tags": tags,
         "link": link,
         "genre": target_genre,
-        "release_dt": release_dt
+        "release_dt": release_dt,
+        "already_posted": False
     }
 
 # ==============================================================================
@@ -296,14 +319,14 @@ def extract_subdomain(target):
     target = target.split('/')[0]
     return target
 
-def fetch_from_artist_or_label(target):
+def fetch_from_artist_or_label(target, posted_set):
     subdomain = extract_subdomain(target)
     if not subdomain:
         return []
 
     url = f"https://{subdomain}.bandcamp.com/music"
     headers = get_headers()
-    print(f" 👤 [АРТИСТ/ЛЕЙБЛ]: Проверяем {subdomain} ({url})...")
+    print(f"👤 [АРТИСТ/ЛЕЙБЛ]: Проверяем {subdomain} ({url})...")
 
     html_text = ""
     if CURL_CFFI_AVAILABLE:
@@ -331,7 +354,6 @@ def fetch_from_artist_or_label(target):
         artist_match = re.search(r'<title>([^<]+)</title>', html_text)
     artist_name = artist_match.group(1).split('|')[0].strip() if artist_match else subdomain
 
-    # Ищем релизы
     grid_items = re.findall(
         r'<a\s+href="(/(?:album|track|a|t)/[^"]+)"[^>]*>.*?<p\s+class="title"[^>]*>\s*([^<]+)\s*</p>',
         html_text,
@@ -342,7 +364,6 @@ def fetch_from_artist_or_label(target):
     items = []
     seen_links = set()
 
-    # Проверяем только первые 3 самых свежих релиза со страницы артиста
     for idx, (path, title) in enumerate(grid_items[:3]):
         clean_title = html.unescape(title.strip())
         full_link = f"https://{subdomain}.bandcamp.com{path}"
@@ -353,7 +374,9 @@ def fetch_from_artist_or_label(target):
             continue
         seen_links.add(full_link)
 
-        # Достаем точную дату публикации со страницы самого релиза
+        if full_link in posted_set:
+            continue
+
         release_dt = get_release_date_from_url(full_link)
         img_url = f"https://f4.bcbits.com/img/a{art_ids[idx]}_10.jpg" if idx < len(art_ids) else ""
 
@@ -366,10 +389,11 @@ def fetch_from_artist_or_label(target):
             "tags": [subdomain],
             "link": full_link,
             "genre": "artist/label",
-            "release_dt": release_dt
+            "release_dt": release_dt,
+            "already_posted": False
         })
 
-    print(f"    Найдено свежих релизов у {artist_name}: {len(items)}")
+    print(f"    Найдено непубликовавшихся релизов у {artist_name}: {len(items)}")
     return items
 
 # ==============================================================================
@@ -419,39 +443,37 @@ def main():
     releases = []
     seen_links = set()
 
-    # 1. Собираем релизы по жанрам
+    # 1. Собираем релизы по жанрам (берём первые DISCOVER_ITEMS_LIMIT элементов)
     for genre in GENRES:
         raw_items = fetch_from_discover_api(genre)
-        for item in raw_items:
-            details = parse_item_details(item, genre)
+        for item in raw_items[:DISCOVER_ITEMS_LIMIT]:
+            details = parse_item_details(item, genre, posted)
             if details and details["link"] and details["link"] not in seen_links:
                 seen_links.add(details["link"])
-                releases.append(details)
+                if not details.get("already_posted"):
+                    releases.append(details)
 
     # 2. Собираем релизы по артистам/лейблам
     for target in TARGET_ARTISTS_AND_LABELS:
-        artist_items = fetch_from_artist_or_label(target)
+        artist_items = fetch_from_artist_or_label(target, posted)
         for details in artist_items:
             if details and details["link"] and details["link"] not in seen_links:
                 seen_links.add(details["link"])
                 releases.append(details)
 
-    print(f"🔎 Всего получено релизов: {len(releases)}")
+    print(f"🔎 Новых (ранее не отправленных) релизов для проверки даты: {len(releases)}")
 
-    # 3. Фильтрация: проверяем, что релиза нет в posted И он подходит по времени
+    # 3. Фильтрация по дате выпуска
     new_releases = []
     for r in releases:
-        if r["link"] in posted:
-            continue
-        
-        # Проверка по временному окну
-        if is_release_new(r.get("release_dt")):
+        rel_date = r.get("release_dt")
+        if is_release_new(rel_date):
             new_releases.append(r)
         else:
-            age_info = f" ({r['release_dt']})" if r.get("release_dt") else " (Дата неизвестна)"
-            print(f" ⏳ Пропущен устаревший релиз: {r['title_full']}{age_info}")
+            date_str = rel_date.strftime("%Y-%m-%d %H:%M UTC") if rel_date else "Не удалось определить"
+            print(f"⏳ Пропущен устаревший релиз: {r['title_full']} (Дата: {date_str})")
 
-    print(f"✨ Новых релизов, подпадающих под временной лимит ({MAX_RELEASE_AGE_HOURS} ч.): {len(new_releases)}")
+    print(f"✨ Релизов, вышедших за последние {MAX_RELEASE_AGE_HOURS} ч.: {len(new_releases)}")
 
     new_posts = 0
     for release in reversed(new_releases):
