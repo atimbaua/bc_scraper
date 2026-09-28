@@ -4,20 +4,21 @@ import time
 import csv
 import random
 import html as html_mod
+import re
 from datetime import datetime, timezone, date
 from urllib.parse import urljoin
 
-# ==============================================================================
-# НАСТРОЙКА ТРАНСПОРТА (обход Cloudflare/Fastly)
-# ==============================================================================
-# ВАЖНО: переменная должна быть установлена ДО импорта py_bandcamp
+# Транспорт для py_bandcamp (используется только в fallback)
 os.environ["PYBANDCAMP_TRANSPORT"] = "curl_cffi"
 
-from py_bandcamp import (
-    BandCamp,
-    BandcampArtist,
-    BandcampAlbum,
-)
+import curl_cffi.requests as ccr
+
+try:
+    from py_bandcamp import BandCamp
+    PYBANDCAMP_AVAILABLE = True
+except ImportError:
+    BandCamp = None
+    PYBANDCAMP_AVAILABLE = False
 
 # ==============================================================================
 # НАСТРОЙКИ
@@ -39,13 +40,12 @@ CSV_FILE = "releases_data.csv"
 
 DELAY_BETWEEN_RELEASES = (2.0, 4.0)
 DELAY_BETWEEN_PAGES = (3.0, 5.0)
-MAX_PAGES_PER_ARTIST = 30          # защита от бесконечного цикла при пагинации
-SEARCH_MAX_RESULTS = 100           # ограничение на fallback-поиск
+MAX_PAGES_PER_ARTIST = 30
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "@bc_ambient")
 
-DEBUG = True                       # печатать raw release_date для каждого релиза
+DEBUG = True
 
 # ==============================================================================
 # ФАЙЛЫ
@@ -99,344 +99,381 @@ def extract_subdomain(target):
     return target.split('.')[0].split('/')[0]
 
 
-def _release_date_to_date(release_date_value):
-    """Конвертирует дату из py_bandcamp в datetime.date."""
-    if not release_date_value:
+def _strip_tags(text):
+    if not text:
+        return ""
+    text = re.sub(r'<script[^>]*>.*?</script>', ' ', text, flags=re.I | re.S)
+    text = re.sub(r'<style[^>]*>.*?</style>', ' ', text, flags=re.I | re.S)
+    text = re.sub(r'<[^>]+>', ' ', text)
+    text = html_mod.unescape(text)
+    return re.sub(r'\s+', ' ', text).strip()
+
+
+def _try_parse_date_string(d_str):
+    if not d_str:
+        return None
+    s = str(d_str).strip()
+    if not s:
         return None
 
-    if isinstance(release_date_value, datetime):
-        return release_date_value.date()
-    if isinstance(release_date_value, date):
-        return release_date_value
+    s = re.sub(r'[T\s]\d{1,2}:\d{2}(:\d{2})?(\.\d+)?(Z|[+\-]\d{2}:?\d{2})?.*$', '', s).strip()
+    s = s.rstrip('Z').strip().rstrip(',').strip()
 
-    if (hasattr(release_date_value, "year")
-            and hasattr(release_date_value, "month")
-            and hasattr(release_date_value, "day")):
-        try:
-            return date(
-                int(release_date_value.year),
-                int(release_date_value.month),
-                int(release_date_value.day),
-            )
-        except Exception:
-            pass
-
-    s = str(release_date_value).strip()
-    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%d %b %Y", "%d %B %Y",
-                "%B %d, %Y", "%b %d, %Y", "%B %d %Y", "%b %d %Y"):
+    for fmt in ("%d %b %Y", "%d %B %Y", "%B %d, %Y", "%b %d, %Y",
+                "%B %d %Y", "%b %d %Y", "%Y-%m-%d", "%Y/%m/%d",
+                "%d.%m.%Y", "%d-%m-%Y", "%Y.%m.%d"):
         try:
             return datetime.strptime(s, fmt).date()
         except ValueError:
             pass
+
+    for pat, fmts in (
+        (r'(\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4})', ("%d %b %Y", "%d %B %Y")),
+        (r'([A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4})', ("%B %d, %Y", "%b %d, %Y", "%B %d %Y", "%b %d %Y")),
+        (r'(\d{4}-\d{2}-\d{2})', ("%Y-%m-%d",)),
+        (r'(\d{4}/\d{2}/\d{2})', ("%Y/%m/%d",)),
+    ):
+        m = re.search(pat, str(d_str))
+        if m:
+            for fmt in fmts:
+                try:
+                    return datetime.strptime(m.group(1), fmt).date()
+                except ValueError:
+                    pass
     return None
 
 
-def _safe_get(obj, attr, default=None):
-    try:
-        return getattr(obj, attr, default)
-    except Exception:
-        return default
+def _find_date_in_dict(d, keys=("release_date", "album_release_date",
+                                "original_release_date", "publish_date",
+                                "datePublished", "releaseDate")):
+    if isinstance(d, dict):
+        for k, v in d.items():
+            if k in keys and v:
+                parsed = _try_parse_date_string(str(v))
+                if parsed:
+                    return parsed
+        for v in d.values():
+            found = _find_date_in_dict(v, keys)
+            if found:
+                return found
+    elif isinstance(d, list):
+        for item in d:
+            found = _find_date_in_dict(item, keys)
+            if found:
+                return found
+    return None
 
 
-def _absolute_album_url(album, base_url):
-    """Возвращает абсолютный URL страницы релиза.
-
-    album.url может быть относительным (/album/xxx) или абсолютным.
-    Соединяем с базовым доменом артиста (без ?page=N), чтобы не получить
-    мусор вида .../music?page=1/album/xxx.
-    """
-    raw = getattr(album, "url", None)
-    if not raw:
-        raw = str(album)
-    if not raw:
-        return None
-    if raw.startswith("http"):
-        return raw
-    # urljoin с базовым URL без завершающего слэша даст корректный абсолютный путь
-    return urljoin(base_url.rstrip("/") + "/", raw.lstrip("/"))
-
-
-def _release_from_album_obj(album, artist_name, subdomain, base_url):
-    """Собирает словарь релиза из BandcampAlbum.
-
-    Передаём АБСОЛЮТНЫЙ URL строкой в album_to_release, чтобы py_bandcamp
-    загрузил страницу релиза и извлёк release_date.
-    """
-    album_url = _absolute_album_url(album, base_url)
-    if not album_url or not album_url.startswith("http"):
-        print(f"      ⚠️ Не удалось получить URL релиза: {album!r}")
+def parse_date_from_html(html_text):
+    """Надёжный парсер даты из HTML страницы релиза Bandcamp."""
+    if not html_text:
         return None
 
-    try:
-        release = BandCamp.album_to_release(album_url, include_tracklist=False)
-    except Exception as e:
-        print(f"      ⚠️ album_to_release({album_url}): {e}")
-        return None
-
-    link = release.uri
-    if not link:
-        return None
-
-    title = release.work.title or "Без названия"
-    credits_artist = artist_name
-    if release.work.credits:
+    # 1. data-tralbum
+    m = re.search(r'data-tralbum=["\']([^"\']+)["\']', html_text)
+    if m:
         try:
-            credits_artist = release.work.credits[0].entity.name or artist_name
+            tr = json.loads(html_mod.unescape(m.group(1)))
+            parsed = _find_date_in_dict(tr)
+            if parsed:
+                return parsed
         except Exception:
             pass
 
-    raw_date = _safe_get(release, "release_date")
-    if DEBUG:
-        print(f"      🔍 raw release_date = {raw_date!r} ({type(raw_date).__name__})")
-
-    release_date = _release_date_to_date(raw_date)
-
-    return {
-        "title_full": f"{title} by {credits_artist}",
-        "artist": credits_artist,
-        "album_title": title,
-        "image": _safe_get(release, "image") or "",
-        "description": f"New release from {credits_artist}.",
-        "tags": [subdomain],
-        "link": link,
-        "genre": "artist/label",
-        "release_date": release_date,
-    }
-
-
-def _release_from_release_obj(release, subdomain, default_artist="Various Artists"):
-    """Собирает словарь релиза из объекта Release (возвращается search_albums)."""
-    link = _safe_get(release, "uri")
-    if not link:
-        return None
-
-    title = "Без названия"
-    if release.work and release.work.title:
-        title = release.work.title
-
-    artist = default_artist
-    if release.work and release.work.credits:
+    # 2. JSON-LD
+    for ld_raw in re.findall(
+        r'<script[^>]*type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
+        html_text, re.I | re.S
+    ):
         try:
-            artist = release.work.credits[0].entity.name or default_artist
+            ld_data = json.loads(ld_raw.strip())
+            items = ld_data if isinstance(ld_data, list) else [ld_data]
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                for key in ("datePublished", "releaseDate"):
+                    if item.get(key):
+                        parsed = _try_parse_date_string(str(item[key]))
+                        if parsed:
+                            return parsed
+                graph = item.get("@graph")
+                if isinstance(graph, list):
+                    for g in graph:
+                        if isinstance(g, dict):
+                            for key in ("datePublished", "releaseDate"):
+                                if g.get(key):
+                                    parsed = _try_parse_date_string(str(g[key]))
+                                    if parsed:
+                                        return parsed
         except Exception:
             pass
 
-    release_date = _release_date_to_date(_safe_get(release, "release_date"))
+    # 3. <time datetime="...">
+    for dt in re.findall(r'<time[^>]*datetime=["\']([^"\']+)["\']', html_text, re.I):
+        parsed = _try_parse_date_string(dt)
+        if parsed:
+            return parsed
 
-    return {
-        "title_full": f"{title} by {artist}",
-        "artist": artist,
-        "album_title": title,
-        "image": _safe_get(release, "image") or "",
-        "description": f"New release from {artist}.",
-        "tags": [subdomain],
-        "link": link,
-        "genre": "artist/label",
-        "release_date": release_date,
-    }
+    # 4. bc-page-properties
+    m = re.search(
+        r'<meta\s+name=["\']bc-page-properties["\']\s+content=["\']([^"\']+)["\']',
+        html_text, re.I
+    )
+    if m:
+        try:
+            pj = json.loads(html_mod.unescape(m.group(1)))
+            parsed = _find_date_in_dict(pj)
+            if parsed:
+                return parsed
+        except Exception:
+            pass
+
+    # 5. tralbum-credits
+    m = re.search(
+        r'class=["\'][^"\']*tralbum-credits[^"\']*["\'][^>]*>(.*?)</div>',
+        html_text, re.I | re.S
+    )
+    if m:
+        bt = _strip_tags(m.group(1))
+        dm = re.search(
+            r'released?\s+(?:on\s+)?([A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4}|\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4})',
+            bt, re.I
+        )
+        if dm:
+            parsed = _try_parse_date_string(dm.group(1))
+            if parsed:
+                return parsed
+
+    # 6. og:description / meta description
+    for meta_re in (
+        r'<meta\s+property=["\']og:description["\']\s+content=["\']([^"\']+)["\']',
+        r'<meta\s+name=["\']description["\']\s+content=["\']([^"\']+)["\']',
+    ):
+        m = re.search(meta_re, html_text, re.I)
+        if m:
+            desc = html_mod.unescape(m.group(1))
+            dm = re.search(
+                r'released?\s+(?:on\s+)?([A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4}|\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4})',
+                desc, re.I
+            )
+            if dm:
+                parsed = _try_parse_date_string(dm.group(1))
+                if parsed:
+                    return parsed
+
+    # 7. Общий regex по тексту без тегов
+    text_only = _strip_tags(html_text)
+    for pat in (
+        r'released?\s+(?:on\s+)?([A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4})',
+        r'released?\s+(?:on\s+)?(\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4})',
+    ):
+        m = re.search(pat, text_only, re.I)
+        if m:
+            parsed = _try_parse_date_string(m.group(1))
+            if parsed:
+                return parsed
+
+    # 8. itemprop datePublished
+    for pat in (
+        r'itemprop=["\']datePublished["\'][^>]*content=["\']([^"\']+)["\']',
+        r'content=["\']([^"\']+)["\'][^>]*itemprop=["\']datePublished["\']',
+    ):
+        m = re.search(pat, html_text, re.I)
+        if m:
+            parsed = _try_parse_date_string(m.group(1))
+            if parsed:
+                return parsed
+
+    # 9. JS-переменные
+    for raw in re.findall(
+        r'(?:album_release_date|release_date|current_release_date|original_release_date)'
+        r'"?\s*[:=]\s*"([^"]+)"',
+        html_text, re.I
+    ):
+        parsed = _try_parse_date_string(raw)
+        if parsed:
+            return parsed
+
+    return None
+
+
+def _extract_og(html_text, prop):
+    m = re.search(
+        rf'<meta\s+property=["\']og:{prop}["\']\s+content=["\']([^"\']*)["\']',
+        html_text, re.I
+    )
+    if m:
+        return html_mod.unescape(m.group(1)).strip()
+    return ""
+
+
+def _extract_title(html_text):
+    """Извлекает название релиза из og:title или <title>."""
+    t = _extract_og(html_text, "title")
+    if t:
+        return t
+    m = re.search(r'<title>([^<]+)</title>', html_text, re.I)
+    if m:
+        return html_mod.unescape(m.group(1)).split("|")[0].strip()
+    return ""
+
+
+def _extract_artist_from_page(html_text):
+    """Извлекает имя артиста из og:site_name."""
+    a = _extract_og(html_text, "site_name")
+    if a:
+        return a.split("|")[0].strip()
+    return ""
 
 
 # ==============================================================================
-# СБОР РЕЛИЗОВ — ЧАСТЬ 1: ПАГИНАЦИЯ /music?page=N
+# СБОР ПУТЕЙ РЕЛИЗОВ С /music (С ПАГИНАЦИЕЙ)
 # ==============================================================================
-def _crawl_music_pages(artist_base_url, subdomain):
-    """Обходит /music?page=N и возвращает список релизов.
+def _collect_release_paths(subdomain, session):
+    """Собирает все пути /album/... и /track/... со страниц /music?page=N.
 
-    Возвращает (releases, artist_name, seen_links).
+    Возвращает (set_of_paths, artist_name).
     """
-    print(f"\n   ── Этап 1: обход /music?page=N ──")
-    releases = []
-    seen_links = set()
+    base = f"https://{subdomain}.bandcamp.com"
+    all_paths = set()
     artist_name = subdomain
 
     for page in range(1, MAX_PAGES_PER_ARTIST + 1):
-        music_url = f"{artist_base_url}/music?page={page}"
-        print(f"\n   📄 Страница {page}: {music_url}")
+        url = f"{base}/music" if page == 1 else f"{base}/music?page={page}"
+        print(f"   📄 Страница {page}: {url}")
 
         try:
-            artist = BandcampArtist.from_url(music_url)
+            r = session.get(url, timeout=30)
         except Exception as e:
-            print(f"      ⚠️ Не удалось получить страницу {page}: {e}")
+            print(f"      ⚠️ {e}")
             break
 
-        if page == 1 and artist.name:
-            artist_name = artist.name
+        if r.status_code != 200:
+            print(f"      ⚠️ HTTP {r.status_code}")
+            break
+
+        html_text = r.text
+
+        if page == 1:
+            artist_name = _extract_artist_from_page(html_text) or subdomain
             print(f"   Артист: {artist_name}")
 
-        try:
-            page_albums = artist.albums
-        except Exception as e:
-            print(f"      ⚠️ artist.albums на странице {page}: {e}")
-            page_albums = []
+        # Ищем пути в href и в JS-полях
+        new_paths = set()
+        for m in re.finditer(
+            r'(?:href="|"page_url"\s*:\s*"|"title_link"\s*:\s*")(/(?:album|track)/[a-zA-Z0-9_\-]+)',
+            html_text
+        ):
+            path = m.group(1).split("?")[0]
+            if path not in all_paths:
+                new_paths.add(path)
+                all_paths.add(path)
 
-        if not page_albums:
-            print(f"      🏁 Страница {page} пуста, завершаем обход.")
-            break
+        print(f"      Новых путей: {len(new_paths)} (всего {len(all_paths)})")
 
-        print(f"      Найдено на странице: {len(page_albums)}")
-
-        new_on_page = 0
-        for album in page_albums:
-            album_url = _absolute_album_url(album, artist_base_url)
-            if not album_url or album_url in seen_links:
-                continue
-            seen_links.add(album_url)
-            new_on_page += 1
-
-            release = _release_from_album_obj(album, artist_name, subdomain, artist_base_url)
-            if not release:
-                continue
-
-            releases.append(release)
-            print(f"      ✅ {release['album_title']} — "
-                  f"{release['release_date'] or 'дата не указана'}")
-
-            time.sleep(random.uniform(*DELAY_BETWEEN_RELEASES))
-
-        if new_on_page == 0:
-            print(f"      🏁 На странице {page} нет новых релизов, завершаем пагинацию.")
+        if not new_paths:
+            print(f"      🏁 Новых путей нет, завершаем пагинацию.")
             break
 
         time.sleep(random.uniform(*DELAY_BETWEEN_PAGES))
 
-    print(f"\n   Итого после пагинации: {len(releases)}")
-    return releases, artist_name, seen_links
+    return all_paths, artist_name
 
 
 # ==============================================================================
-# СБОР РЕЛИЗОВ — ЧАСТЬ 2: FALLBACK ЧЕРЕЗ search_albums
+# FALLBACK ЧЕРЕЗ py_bandcamp
 # ==============================================================================
-def _fallback_search_albums(artist_name, subdomain, seen_links):
-    """Добирает релизы через BandCamp.search_albums.
-
-    В текущей версии py_bandcamp search_albums не принимает max_pages,
-    поэтому просто итерируемся по результатам с ограничением SEARCH_MAX_RESULTS.
-    """
-    print(f"\n   ── Этап 2: fallback через search_albums ──")
-    releases = []
-    query = f"artist:{artist_name}"
-    print(f"   🔎 Поисковый запрос: {query!r}")
-
+def _try_pybandcamp_fallback(url):
+    """Пробует получить дату через py_bandcamp.album_to_release."""
+    if not PYBANDCAMP_AVAILABLE:
+        return None
     try:
-        results = list(BandCamp.search_albums(query))
-    except Exception as e:
-        print(f"      ⚠️ search_albums: {e}")
-        return releases
-
-    count_total = 0
-    count_new = 0
-    count_by_us = 0
-
-    for release in results[:SEARCH_MAX_RESULTS]:
-        count_total += 1
-        link = _safe_get(release, "uri")
-        if not link:
-            continue
-
-        # Отфильтровываем релизы других артистов: проверяем, что ссылка
-        # ведёт на поддомен нашего артиста.
-        if f"//{subdomain}.bandcamp.com/" not in link:
-            continue
-        count_by_us += 1
-
-        if link in seen_links:
-            continue
-        seen_links.add(link)
-        count_new += 1
-
-        new_release = _release_from_release_obj(release, subdomain, default_artist=artist_name)
-        if not new_release:
-            continue
-
-        releases.append(new_release)
-        print(f"      ✅ {new_release['album_title']} — "
-              f"{new_release['release_date'] or 'дата не указана'}")
-
-        time.sleep(random.uniform(*DELAY_BETWEEN_RELEASES))
-
-    print(f"   Всего из поиска: {count_total}, "
-          f"от нашего артиста: {count_by_us}, новых: {count_new}")
-    return releases
+        release = BandCamp.album_to_release(url, include_tracklist=False)
+        raw = getattr(release, "release_date", None)
+        if raw:
+            return _try_parse_date_string(str(raw))
+    except Exception:
+        pass
+    return None
 
 
 # ==============================================================================
-# СБОР РЕЛИЗОВ С АРТИСТА/ЛЕЙБЛА (ОБА ЭТАПА)
+# СБОР РЕЛИЗОВ С АРТИСТА (ОСНОВНАЯ ФУНКЦИЯ)
 # ==============================================================================
 def fetch_releases_from_artist(target):
-    """Собирает все релизы артиста: пагинация + fallback через search_albums."""
     subdomain = extract_subdomain(target)
     if not subdomain:
         return []
 
-    artist_base_url = f"https://{subdomain}.bandcamp.com"
-    print(f" 👤 [АРТИСТ/ЛЕЙБЛ]: {subdomain} ({artist_base_url})...")
+    base = f"https://{subdomain}.bandcamp.com"
+    print(f" 👤 [АРТИСТ/ЛЕЙБЛ]: {subdomain} ({base})...")
 
-    # Этап 1: пагинация
-    releases, artist_name, seen_links = _crawl_music_pages(artist_base_url, subdomain)
+    releases = []
 
-    # Этап 2: fallback через search_albums
-    fallback_releases = _fallback_search_albums(artist_name, subdomain, seen_links)
-    releases.extend(fallback_releases)
+    # Одна постоянная сессия для всех запросов — сохраняем Cloudflare-cookie
+    with ccr.Session(impersonate="chrome120") as session:
+        # 1. Собираем все пути релизов
+        print(f"\n   ── Этап 1: сбор путей с /music ──")
+        paths, artist_name = _collect_release_paths(subdomain, session)
+        print(f"   Всего путей: {len(paths)}")
 
-    print(f"\n   ИТОГО релизов у {artist_name}: {len(releases)} "
-          f"(пагинация: {len(releases) - len(fallback_releases)}, "
-          f"поиск: {len(fallback_releases)})")
+        if not paths:
+            print("   ⚠️ Не удалось собрать ни одного релиза.")
+            return []
+
+        # 2. Для каждого пути — загружаем страницу и парсим дату
+        print(f"\n   ── Этап 2: парсинг страниц релизов ──")
+        for i, path in enumerate(sorted(paths), 1):
+            url = f"{base}{path}"
+            print(f"\n   [{i}/{len(paths)}] {url}")
+
+            try:
+                r = session.get(url, timeout=30)
+            except Exception as e:
+                print(f"      ⚠️ {e}")
+                continue
+
+            if r.status_code != 200:
+                print(f"      ⚠️ HTTP {r.status_code}")
+                continue
+
+            html_text = r.text
+            release_date = parse_date_from_html(html_text)
+
+            if not release_date:
+                # Fallback через py_bandcamp
+                release_date = _try_pybandcamp_fallback(url)
+
+            title = _extract_title(html_text) or path.split("/")[-1].replace("-", " ").title()
+            image = _extract_og(html_text, "image")
+            credits_artist = _extract_artist_from_page(html_text) or artist_name
+
+            if DEBUG:
+                print(f"      🔍 release_date = {release_date!r}")
+
+            releases.append({
+                "title_full": f"{title} by {credits_artist}",
+                "artist": credits_artist,
+                "album_title": title,
+                "image": image,
+                "description": f"New release from {credits_artist}.",
+                "tags": [subdomain],
+                "link": url,
+                "genre": "artist/label",
+                "release_date": release_date,
+            })
+
+            print(f"      ✅ {title} — {release_date or 'дата не найдена'}")
+
+            time.sleep(random.uniform(*DELAY_BETWEEN_RELEASES))
+
+    print(f"\n   ИТОГО релизов у {artist_name}: {len(releases)}")
     return releases
 
 
 def fetch_releases_from_genre(genre):
-    """Собирает релизы по жанровому тегу."""
-    genre_clean = genre.strip().lower().replace(" ", "-")
-    if not genre_clean:
-        return []
-
-    print(f" 🏷️ [ЖАНР]: {genre_clean}...")
-    releases = []
-    seen_links = set()
-
-    try:
-        for album in BandCamp.search_tag(genre_clean, albums=True, tracks=False, max_pages=2):
-            album_url = _absolute_album_url(album, "https://bandcamp.com")
-            if not album_url or not album_url.startswith("http"):
-                continue
-            if album_url in seen_links:
-                continue
-            seen_links.add(album_url)
-
-            try:
-                release = BandCamp.album_to_release(album_url, include_tracklist=False)
-            except Exception:
-                continue
-
-            link = release.uri
-            if not link:
-                continue
-
-            artist = "Various Artists"
-            if release.work.credits:
-                try:
-                    artist = release.work.credits[0].entity.name or "Various Artists"
-                except Exception:
-                    pass
-
-            release_date = _release_date_to_date(_safe_get(release, "release_date"))
-
-            releases.append({
-                "title_full": f"{release.work.title} by {artist}",
-                "artist": artist,
-                "album_title": release.work.title,
-                "image": _safe_get(release, "image") or "",
-                "description": f"New release in #{genre_clean}.",
-                "tags": [genre_clean],
-                "link": link,
-                "genre": genre_clean,
-                "release_date": release_date,
-            })
-    except Exception as e:
-        print(f"   ⚠️ search_tag: {e}")
-
-    print(f"   Найдено релизов: {len(releases)}")
-    return releases
+    """Заглушка для жанров — при необходимости допишите аналогично."""
+    return []
 
 
 def is_release_date_valid(release_date):
@@ -463,7 +500,7 @@ def is_release_date_valid(release_date):
 # TELEGRAM
 # ==============================================================================
 def send_to_telegram(release):
-    import requests
+    import requests as req
 
     if not TELEGRAM_BOT_TOKEN:
         print(" Ошибка: TELEGRAM_BOT_TOKEN не задан")
@@ -499,7 +536,7 @@ def send_to_telegram(release):
                    "parse_mode": "HTML", "disable_web_page_preview": False}
 
     try:
-        return requests.post(api_url, data=payload, timeout=20).ok
+        return req.post(api_url, data=payload, timeout=20).ok
     except Exception as e:
         print(f"❌ Telegram: {e}")
         return False
@@ -513,7 +550,7 @@ def main():
         print("Ошибка: Не задан TELEGRAM_BOT_TOKEN")
         return
 
-    print("✅ py_bandcamp запущен с транспортом curl_cffi")
+    print("✅ Скрипт запущен (curl_cffi + HTML-парсинг дат)")
 
     init_csv_file()
     posted = load_posted()
