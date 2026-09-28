@@ -28,10 +28,10 @@ TARGET_ARTISTS_AND_LABELS = [
 ]
 
 # 3. Фильтрация по дате выхода релиза
-MAX_DAYS_AGO = 30         # Публиковать релизы, вышедшие не позднее чем N дней назад
+MAX_DAYS_AGO = 30        # Публиковать релизы, вышедшие не позднее чем N дней назад
 ALLOW_UPCOMING = True    # Разрешить публикацию анонсов / предзаказов ("releases ...")
 
-MAX_POSTS_PER_RUN = 5       # Лимит постов за 1 запуск
+MAX_POSTS_PER_RUN = 10      # Лимит постов за 1 запуск
 POSTED_FILE = "posted_releases.json"
 CSV_FILE = "releases_data.csv"
 
@@ -141,7 +141,7 @@ def fetch_release_date(url):
     if not html_text:
         return None
 
-    # Поиск текста вида "released September 27, 2026" или "releases June 15, 2027"
+    # Вариант 1: Поиск текста "released Month DD, YYYY" или "releases Month DD, YYYY"
     date_match = re.search(r'(?:released|releases)\s+([A-Za-z]+\s+\d{1,2},\s+\d{4})', html_text, re.IGNORECASE)
     if date_match:
         date_str = date_match.group(1).strip()
@@ -151,14 +151,31 @@ def fetch_release_date(url):
             except ValueError:
                 pass
 
+    # Вариант 2: Поиск текста "released DD Month YYYY"
+    date_match_alt = re.search(r'(?:released|releases)\s+(\d{1,2}\s+[A-Za-z]+\s+\d{4})', html_text, re.IGNORECASE)
+    if date_match_alt:
+        date_str = date_match_alt.group(1).strip()
+        for fmt in ("%d %B %Y", "%d %b %Y"):
+            try:
+                return datetime.strptime(date_str, fmt).date()
+            except ValueError:
+                pass
+
+    # Вариант 3: Поиск datePublished в JSON-LD
+    json_ld = re.search(r'"datePublished"\s*:\s*"([^"]+)"', html_text)
+    if json_ld:
+        raw_d = json_ld.group(1).strip()
+        try:
+            if "T" in raw_d:
+                return datetime.fromisoformat(raw_d.replace("Z", "+00:00")).date()
+            return datetime.strptime(raw_d, "%Y-%m-%d").date()
+        except Exception:
+            pass
+
     return None
 
 def is_release_date_valid(release_date):
-    """
-    Проверяет соответствие даты релиза критериям MAX_DAYS_AGO и ALLOW_UPCOMING.
-    """
     if release_date is None:
-        # Если дату распарсить не удалось, пропускаем проверку (публикуем)
         print("   ⚠️ Дата релиза не найдена на странице, публикация по умолчанию.")
         return True
 
@@ -166,13 +183,11 @@ def is_release_date_valid(release_date):
     days_diff = (today - release_date).days
 
     if days_diff < 0:
-        # Релиз выйдет в будущем
         is_ok = ALLOW_UPCOMING
         status = "Анонс / Предзаказ" if is_ok else "Пропущен (предзаказ)"
         print(f"   📅 Дата релиза: {release_date} ({status})")
         return is_ok
     else:
-        # Релиз уже вышел
         is_ok = days_diff <= MAX_DAYS_AGO
         status = f"{days_diff} дн. назад" if is_ok else f"Устарел ({days_diff} дн. назад)"
         print(f"   📅 Дата релиза: {release_date} ({status})")
@@ -365,51 +380,88 @@ def fetch_from_artist_or_label(target):
         return []
 
     # Получаем имя артиста/лейбла
-    artist_match = re.search(r'<meta\s+property="og:site_name"\s+content="([^"]+)"', html_text)
+    artist_match = re.search(r'<meta\s+property="og:site_name"\s+content="([^"]+)"', html_text, re.IGNORECASE)
     if not artist_match:
-        artist_match = re.search(r'<title>([^<]+)</title>', html_text)
+        artist_match = re.search(r'<title>([^<]+)</title>', html_text, re.IGNORECASE)
     artist_name = artist_match.group(1).split('|')[0].strip() if artist_match else subdomain
 
     items = []
+    seen_links = set()
 
-    # 1. Поиск элементов сетки по классам
-    grid_items = re.findall(
-        r'<a\s+href="(/(?:album|track)/[^"?#]+)"[^>]*>.*?<(?:p|span)\s+class="title"[^>]*>\s*([^<]+)\s*</(?:p|span)>',
-        html_text,
-        re.DOTALL | re.IGNORECASE
-    )
+    # 1. ОСНОВНОЙ СПОСОБ: Парсинг JSON-данных из атрибута data-client-items на <ol id="music-grid">
+    client_items_match = re.search(r'data-client-items="([^"]+)"', html_text)
+    if client_items_match:
+        try:
+            raw_json = html.unescape(client_items_match.group(1))
+            client_items = json.loads(raw_json)
+            for c_item in client_items:
+                path = c_item.get("page_url") or c_item.get("title_link")
+                title = c_item.get("title")
+                art_id = c_item.get("art_id")
+                if path and title:
+                    full_link = f"https://{subdomain}.bandcamp.com{path}"
+                    full_link = full_link.replace(".bandcamp.com/a/", ".bandcamp.com/album/").replace(".bandcamp.com/t/", ".bandcamp.com/track/")
+                    if full_link not in seen_links and ("/album/" in full_link or "/track/" in full_link):
+                        seen_links.add(full_link)
+                        img_url = f"https://f4.bcbits.com/img/a{art_id}_10.jpg" if art_id else ""
+                        items.append({
+                            "title_full": f"{title} by {artist_name}",
+                            "artist": artist_name,
+                            "album_title": title,
+                            "image": img_url,
+                            "description": f"New release from {artist_name}.",
+                            "tags": [subdomain],
+                            "link": full_link,
+                            "genre": "artist/label"
+                        })
+        except Exception as e:
+            print(f"   ⚠️ Не удалось распарсить data-client-items: {e}")
 
-    # 2. Если элемента сетки по классам не нашлось, ищем любые ссылки на /album/ или /track/
-    if not grid_items:
-        raw_paths = re.findall(r'href="(/(?:album|track)/[a-zA-Z0-9\-_]+)"', html_text, re.IGNORECASE)
-        unique_paths = []
-        for p in raw_paths:
-            if p not in unique_paths:
-                unique_paths.append(p)
+    # 2. ВТОРОЙ СПОСОБ: Если JSON отсутствует, ищем карточки элементов <li class="music-grid-item">
+    if not items:
+        grid_li_blocks = re.findall(r'<li[^>]*class="[^"]*music-grid-item[^"]*"[^>]*>(.*?)</li>', html_text, re.DOTALL | re.IGNORECASE)
+        for block in grid_li_blocks:
+            link_m = re.search(r'href="(/(?:album|track|a|t)/[^"?#]+)"', block, re.IGNORECASE)
+            title_m = re.search(r'<p\s+class="title"[^>]*>(.*?)</p>', block, re.DOTALL | re.IGNORECASE)
+            img_m = re.search(r'src="([^"]+)"', block)
 
-        for path in unique_paths:
-            title_match = re.search(
-                r'href="' + re.escape(path) + r'"[^>]*>.*?<(?:p|span|div)[^>]*class="[^"]*title[^"]*"[^>]*>\s*([^<]+)\s*</',
-                html_text,
-                re.DOTALL | re.IGNORECASE
-            )
-            if title_match:
-                title_text = title_match.group(1).strip()
-            else:
-                title_text = path.split("/")[-1].replace("-", " ").title()
-            grid_items.append((path, title_text))
+            if link_m:
+                path = link_m.group(1)
+                full_link = f"https://{subdomain}.bandcamp.com{path}"
+                full_link = full_link.replace(".bandcamp.com/a/", ".bandcamp.com/album/").replace(".bandcamp.com/t/", ".bandcamp.com/track/")
 
-    # 3. Резерв: Если сетка пуста, проверяем, не перенаправил ли Bandcamp сразу на единственный альбом
-    if not grid_items:
-        og_url = re.search(r'<meta\s+property="og:url"\s+content="([^"]+)"', html_text)
-        og_title = re.search(r'<meta\s+property="og:title"\s+content="([^"]+)"', html_text)
+                if full_link in seen_links or not ("/album/" in full_link or "/track/" in full_link):
+                    continue
+
+                if title_m:
+                    clean_title = re.sub(r'<[^>]+>', '', title_m.group(1)).strip()
+                else:
+                    clean_title = path.split("/")[-1].replace("-", " ").title()
+
+                clean_title = html.unescape(clean_title)
+                seen_links.add(full_link)
+                img_url = img_m.group(1) if img_m else ""
+
+                items.append({
+                    "title_full": f"{clean_title} by {artist_name}",
+                    "artist": artist_name,
+                    "album_title": clean_title,
+                    "image": img_url,
+                    "description": f"New release from {artist_name}.",
+                    "tags": [subdomain],
+                    "link": full_link,
+                    "genre": "artist/label"
+                })
+
+    # 3. РЕЗЕРВНЫЙ СПОСОБ: Если у артиста всего 1 релиз и Bandcamp открывает его сразу
+    if not items:
+        og_url = re.search(r'<meta\s+property="og:url"\s+content="([^"]+)"', html_text, re.IGNORECASE)
+        og_title = re.search(r'<meta\s+property="og:title"\s+content="([^"]+)"', html_text, re.IGNORECASE)
         if og_url and og_title:
             link = og_url.group(1).replace(".bandcamp.com/a/", ".bandcamp.com/album/").replace(".bandcamp.com/t/", ".bandcamp.com/track/")
-            
-            # ВАЖНО: Принимаем только если это прямая ссылка на альбом/трек, а не на страницу /music или корень
             if "/album/" in link or "/track/" in link:
                 title = html.unescape(og_title.group(1).strip())
-                og_img = re.search(r'<meta\s+property="og:image"\s+content="([^"]+)"', html_text)
+                og_img = re.search(r'<meta\s+property="og:image"\s+content="([^"]+)"', html_text, re.IGNORECASE)
                 img = og_img.group(1) if og_img else ""
                 
                 items.append({
@@ -422,38 +474,6 @@ def fetch_from_artist_or_label(target):
                     "link": link,
                     "genre": "artist/label"
                 })
-                print(f"    Найдено релизов у {artist_name}: {len(items)}")
-                return items
-
-    art_ids = re.findall(r'f4\.bcbits\.com/img/a(\d+)_\d+\.jpg', html_text)
-
-    seen_links = set()
-    for idx, (path, title) in enumerate(grid_items):
-        clean_title = html.unescape(title.strip())
-        full_link = f"https://{subdomain}.bandcamp.com{path}"
-        full_link = full_link.replace(".bandcamp.com/a/", ".bandcamp.com/album/")
-        full_link = full_link.replace(".bandcamp.com/t/", ".bandcamp.com/track/")
-
-        # Исключаем попадание ссылок на саму страницу лейбла
-        if "/album/" not in full_link and "/track/" not in full_link:
-            continue
-
-        if full_link in seen_links:
-            continue
-        seen_links.add(full_link)
-
-        img_url = f"https://f4.bcbits.com/img/a{art_ids[idx]}_10.jpg" if idx < len(art_ids) else ""
-
-        items.append({
-            "title_full": f"{clean_title} by {artist_name}",
-            "artist": artist_name,
-            "album_title": clean_title,
-            "image": img_url,
-            "description": f"New release from {artist_name}.",
-            "tags": [subdomain],
-            "link": full_link,
-            "genre": "artist/label"
-        })
 
     print(f"    Найдено релизов у {artist_name}: {len(items)}")
     return items
