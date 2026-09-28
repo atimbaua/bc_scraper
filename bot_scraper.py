@@ -111,12 +111,27 @@ def parse_date_from_html(html_text):
     # Нормализуем HTML: заменяем переносы строк и спец-пробелы на обычные пробелы
     clean_html = re.sub(r'\s+', ' ', html_text)
 
+    # 0. Поиск в JSON-LD (<script type="application/ld+json">) — самый надежный способ Bandcamp
+    ld_matches = re.findall(
+        r'<script[^>]*type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
+        html_text,
+        re.IGNORECASE | re.DOTALL
+    )
+    for ld_raw in ld_matches:
+        try:
+            ld_data = json.loads(ld_raw.strip())
+            date_str = ld_data.get("datePublished") or ld_data.get("releaseDate")
+            if date_str:
+                if "T" in date_str:
+                    return datetime.fromisoformat(date_str.replace("Z", "+00:00")).date()
+                return datetime.strptime(date_str[:10], "%Y-%m-%d").date()
+        except Exception:
+            pass
+
     # 1. Поиск в JS-переменной TrAlbumData (Самый надежный способ на Bandcamp!)
-    # Пример: album_release_date: "26 Mar 2021 00:00:00 GMT" или release_date: "26 Mar 2021 ..."
     tr_match = re.search(r'(?:album_release_date|release_date)"?\s*:\s*"([^"]+)"', clean_html, re.IGNORECASE)
     if tr_match:
         raw_date_str = tr_match.group(1).strip()
-        # Извлекаем подстроку даты вида "26 Mar 2021"
         date_part = re.search(r'(\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4})', raw_date_str)
         if date_part:
             d_str = date_part.group(1)
@@ -382,9 +397,9 @@ def fetch_from_genre(genre):
                 try:
                     blob_json = json.loads(html.unescape(blob_match.group(1)))
                     hub_items = (blob_json.get("hub_data", {}).get("dig_deeper", {}).get("items", []) or
-                                 blob_json.get("tab_data", {}).get("dig_deeper", {}).get("items", []) or
-                                 blob_json.get("dig_deeper", {}).get("items", []) or
-                                 blob_json.get("items", []))
+                                   blob_json.get("tab_data", {}).get("dig_deeper", {}).get("items", []) or
+                                   blob_json.get("dig_deeper", {}).get("items", []) or
+                                   blob_json.get("items", []))
 
                     for item in hub_items:
                         link = item.get("tralbum_url") or item.get("link") or item.get("page_url")
@@ -429,7 +444,7 @@ def fetch_from_genre(genre):
                             "genre": genre_clean
                         })
 
-    print(f"    Найдено релизов по жанру '{genre_clean}': {len(raw_items)}")
+    print(f"   Найдено релизов по жанру '{genre_clean}': {len(raw_items)}")
     return raw_items
 
 # ==============================================================================
@@ -544,7 +559,7 @@ def fetch_from_artist_or_label(target):
                 }
 
     raw_items = list(releases_map.values())
-    print(f"    Найдено всего релизов в каталоге {artist_name}: {len(raw_items)}")
+    print(f"   Найдено всего релизов в каталоге {artist_name}: {len(raw_items)}")
     return raw_items
 
 # ==============================================================================
