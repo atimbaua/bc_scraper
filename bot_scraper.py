@@ -136,8 +136,8 @@ def parse_date_from_html(html_text):
             except ValueError:
                 pass
 
-    # 4. Поиск datePublished в JSON-LD
-    json_ld = re.search(r'"datePublished"\s*:\s*"([^"]+)"', html_text)
+    # 4. Поиск datePublished / releaseDate в JSON-LD
+    json_ld = re.search(r'"(?:datePublished|releaseDate)"\s*:\s*"([^"]+)"', html_text, re.IGNORECASE)
     if json_ld:
         raw_d = json_ld.group(1).strip()
         try:
@@ -150,9 +150,6 @@ def parse_date_from_html(html_text):
     return None
 
 def fetch_release_date(url):
-    """
-    Надежный забор HTML релиза через многоуровневый обход (ScraperAPI -> curl_cffi -> requests)
-    """
     headers = get_headers()
     html_text = ""
 
@@ -394,7 +391,7 @@ def fetch_from_artist_or_label(target):
     items = []
     seen_links = set()
 
-    # Извлечение через JSON data-client-items
+    # 1. Считываем JSON из data-client-items
     client_items_match = re.search(r'data-client-items="([^"]+)"', html_text)
     if client_items_match:
         try:
@@ -404,6 +401,8 @@ def fetch_from_artist_or_label(target):
                 path = c_item.get("page_url") or c_item.get("title_link")
                 title = c_item.get("title")
                 art_id = c_item.get("art_id")
+                item_id = c_item.get("id") or c_item.get("item_id") or 0
+
                 if path and title:
                     full_link = f"https://{subdomain}.bandcamp.com{path}" if path.startswith("/") else path
                     full_link = full_link.replace(".bandcamp.com/a/", ".bandcamp.com/album/").replace(".bandcamp.com/t/", ".bandcamp.com/track/")
@@ -411,6 +410,7 @@ def fetch_from_artist_or_label(target):
                         seen_links.add(full_link)
                         img_url = f"https://f4.bcbits.com/img/a{art_id}_10.jpg" if art_id else ""
                         items.append({
+                            "item_id": int(item_id),
                             "title_full": f"{title} by {artist_name}",
                             "artist": artist_name,
                             "album_title": title,
@@ -423,15 +423,16 @@ def fetch_from_artist_or_label(target):
         except Exception as e:
             print(f"   ⚠️ Ошибка чтения data-client-items: {e}")
 
-    # Запасной вход через HTML теги <a>
+    # 2. Запасной доступ через HTML
     if not items:
         all_album_links = re.findall(r'href="(/(?:album|track)/[a-zA-Z0-9\-_]+)"', html_text, re.IGNORECASE)
-        for path in all_album_links:
+        for idx, path in enumerate(all_album_links):
             full_link = f"https://{subdomain}.bandcamp.com{path}"
             if full_link not in seen_links:
                 seen_links.add(full_link)
                 title_slug = path.split("/")[-1].replace("-", " ").title()
                 items.append({
+                    "item_id": len(all_album_links) - idx, # Чем выше ссылка в DOM, тем она новее
                     "title_full": f"{title_slug} by {artist_name}",
                     "artist": artist_name,
                     "album_title": title_slug,
@@ -442,14 +443,8 @@ def fetch_from_artist_or_label(target):
                     "genre": "artist/label"
                 })
 
-    # СОРТИРОВКА: Свежие релизы содержат бóльшие значения art_id
-    def get_sort_key(item):
-        match = re.search(r'/a(\d+)_\d+\.jpg', item.get("image", ""))
-        if match:
-            return int(match.group(1))
-        return 0
-
-    items.sort(key=get_sort_key, reverse=True)
+    # СОРТИРОВКА: Сортируем по item_id (в Bandcamp новые релизы ВСЕГДА имеют больший ID)
+    items.sort(key=lambda x: x.get("item_id", 0), reverse=True)
 
     print(f"    Найдено ВСЕГО релизов у {artist_name}: {len(items)}")
     return items
@@ -545,11 +540,10 @@ def main():
 
         print(f"\n🔍 Проверка даты для: {release['title_full']}")
         
-        # Получаем точную дату через многоуровневый обход с ScraperAPI/curl_cffi
         release_date = fetch_release_date(release["link"])
 
         if not is_release_date_valid(release_date):
-            posted.add(release["link"])
+            # НЕ ДОБАВЛЯЕМ старые релизы в posted, чтобы не засорять JSON старыми ссылками!
             continue
 
         print(f"🚀 Публикация в Telegram: {release['title_full']}")
