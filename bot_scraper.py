@@ -35,7 +35,7 @@ TARGET_ARTISTS_AND_LABELS = [
 # None или 0 = отключить фильтрацию по времени (постить всё старое)
 MAX_RELEASE_AGE_HOURS = 24   
 
-MAX_POSTS_PER_RUN = 3       # Лимит постов за 1 запуск
+MAX_POSTS_PER_RUN = 20       # Лимит постов за 1 запуск
 POSTED_FILE = "posted_releases.json"
 CSV_FILE = "releases_data.csv"
 
