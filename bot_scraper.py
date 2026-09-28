@@ -41,6 +41,8 @@ DELAY_BETWEEN_RELEASES = (2.0, 4.0)
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "@bc_ambient")
 
+DEBUG = True  # включить отладочные сообщения о датах
+
 # ==============================================================================
 # ФАЙЛЫ
 # ==============================================================================
@@ -85,7 +87,7 @@ def save_to_csv(details):
 
 
 # ==============================================================================
-# СБОР РЕЛИЗОВ ЧЕРЕЗ py_bandcamp (актуальное API)
+# ХЕЛПЕРЫ
 # ==============================================================================
 def extract_subdomain(target):
     target = target.strip().lower()
@@ -93,18 +95,61 @@ def extract_subdomain(target):
     return target.split('.')[0].split('/')[0]
 
 
-def _release_date_to_date(release_date_str):
-    """Конвертирует строку IsoDate (YYYY-MM-DD) в datetime.date."""
-    if not release_date_str:
+def _release_date_to_date(release_date_value):
+    """Конвертирует дату из py_bandcamp в datetime.date.
+
+    py_bandcamp может вернуть:
+      - None
+      - строку "YYYY-MM-DD"
+      - строку "DD Mon YYYY"
+      - объект с атрибутом .year/.month/.day (например, datetime или IsoDate)
+    """
+    if not release_date_value:
         return None
+
+    # Если уже datetime/date
+    if isinstance(release_date_value, datetime):
+        return release_date_value.date()
+    if isinstance(release_date_value, date):
+        return release_date_value
+
+    # Если объект с year/month/day (например, pydantic IsoDate)
+    for attr in ("year", "month", "day"):
+        if not hasattr(release_date_value, attr):
+            break
+    else:
+        try:
+            return date(
+                int(release_date_value.year),
+                int(release_date_value.month),
+                int(release_date_value.day),
+            )
+        except Exception:
+            pass
+
+    # Строковые форматы
+    s = str(release_date_value).strip()
+    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%d %b %Y", "%d %B %Y",
+                "%B %d, %Y", "%b %d, %Y"):
+        try:
+            return datetime.strptime(s, fmt).date()
+        except ValueError:
+            pass
+    return None
+
+
+def _safe_get(obj, attr, default=None):
     try:
-        return datetime.strptime(release_date_str, "%Y-%m-%d").date()
-    except ValueError:
-        return None
+        return getattr(obj, attr, default)
+    except Exception:
+        return default
 
 
+# ==============================================================================
+# СБОР РЕЛИЗОВ ЧЕРЕЗ py_bandcamp
+# ==============================================================================
 def fetch_releases_from_artist(target):
-    """Собирает все релизы артиста/лейбла через py_bandcamp и сразу достаёт даты."""
+    """Собирает все релизы артиста/лейбла и извлекает даты через album_to_release."""
     subdomain = extract_subdomain(target)
     if not subdomain:
         return []
@@ -115,7 +160,7 @@ def fetch_releases_from_artist(target):
     releases = []
     seen_links = set()
 
-    # 1. Создаём объект артиста
+    # 1. Объект артиста
     try:
         artist = BandcampArtist.from_url(artist_url)
         artist_name = artist.name or subdomain
@@ -124,12 +169,12 @@ def fetch_releases_from_artist(target):
         print(f"   ⚠️ Не удалось получить артиста: {e}")
         return []
 
-    # 2. Получаем список альбомов
+    # 2. Список альбомов
     try:
         albums = artist.albums
     except Exception as e:
         print(f"   ⚠️ Не удалось получить альбомы: {e}")
-        albums = []
+        return []
 
     if not albums:
         print("   ⚠️ Альбомы не найдены.")
@@ -137,34 +182,41 @@ def fetch_releases_from_artist(target):
 
     print(f"   Найдено альбомов: {len(albums)}")
 
-    # 3. Для каждого альбома получаем Release (с датой)
+    # 3. Каждый альбом -> Release (с датой)
     for album in albums:
         try:
-            # album может быть объектом BandcampAlbum или URL
-            if isinstance(album, BandcampAlbum):
-                album_obj = album
-            else:
-                album_obj = BandcampAlbum.from_url(str(album))
+            release = BandCamp.album_to_release(album, include_tracklist=False)
+        except Exception as e:
+            print(f"      ⚠️ album_to_release: {e}")
+            continue
 
-            release = BandCamp.album_to_release(album_obj, include_tracklist=False)
-
+        try:
             link = release.uri
             if not link or link in seen_links:
                 continue
             seen_links.add(link)
 
-            # Извлекаем артиста из credits, если возможно
+            # Название и артист
+            title = release.work.title or "Без названия"
             credits_artist = artist_name
             if release.work.credits:
-                credits_artist = release.work.credits[0].entity.name or artist_name
+                try:
+                    credits_artist = release.work.credits[0].entity.name or artist_name
+                except Exception:
+                    pass
 
-            release_date = _release_date_to_date(release.release_date)
+            # Дата
+            raw_date = _safe_get(release, "release_date")
+            if DEBUG and raw_date is not None:
+                print(f"      🔍 raw release_date = {raw_date!r} ({type(raw_date).__name__})")
+
+            release_date = _release_date_to_date(raw_date)
 
             releases.append({
-                "title_full": f"{release.work.title} by {credits_artist}",
+                "title_full": f"{title} by {credits_artist}",
                 "artist": credits_artist,
-                "album_title": release.work.title,
-                "image": release.image or "",
+                "album_title": title,
+                "image": _safe_get(release, "image") or "",
                 "description": f"New release from {credits_artist}.",
                 "tags": [subdomain],
                 "link": link,
@@ -172,10 +224,10 @@ def fetch_releases_from_artist(target):
                 "release_date": release_date,
             })
 
-            print(f"      ✅ {release.work.title} — {release_date or 'дата не указана'}")
+            print(f"      ✅ {title} — {release_date or 'дата не указана'}")
 
         except Exception as e:
-            print(f"      ⚠️ Ошибка обработки альбома: {e}")
+            print(f"      ⚠️ Обработка релиза: {e}")
             continue
 
     print(f"   Итого релизов: {len(releases)}")
@@ -183,7 +235,7 @@ def fetch_releases_from_artist(target):
 
 
 def fetch_releases_from_genre(genre):
-    """Собирает релизы по жанровому тегу через BandCamp.search_tag."""
+    """Собирает релизы по жанровому тегу."""
     genre_clean = genre.strip().lower().replace(" ", "-")
     if not genre_clean:
         return []
@@ -193,7 +245,12 @@ def fetch_releases_from_genre(genre):
     seen_links = set()
 
     try:
-        for release in BandCamp.search_tag(genre_clean, albums=True, tracks=False, max_pages=2):
+        for album in BandCamp.search_tag(genre_clean, albums=True, tracks=False, max_pages=2):
+            try:
+                release = BandCamp.album_to_release(album, include_tracklist=False)
+            except Exception:
+                continue
+
             link = release.uri
             if not link or link in seen_links:
                 continue
@@ -201,15 +258,18 @@ def fetch_releases_from_genre(genre):
 
             artist = "Various Artists"
             if release.work.credits:
-                artist = release.work.credits[0].entity.name or "Various Artists"
+                try:
+                    artist = release.work.credits[0].entity.name or "Various Artists"
+                except Exception:
+                    pass
 
-            release_date = _release_date_to_date(release.release_date)
+            release_date = _release_date_to_date(_safe_get(release, "release_date"))
 
             releases.append({
                 "title_full": f"{release.work.title} by {artist}",
                 "artist": artist,
                 "album_title": release.work.title,
-                "image": release.image or "",
+                "image": _safe_get(release, "image") or "",
                 "description": f"New release in #{genre_clean}.",
                 "tags": [genre_clean],
                 "link": link,
@@ -233,10 +293,13 @@ def is_release_date_valid(release_date):
 
     if days_diff < 0:
         is_ok = ALLOW_UPCOMING
-        print(f"   📅 Дата релиза: {release_date} ({'Анонс / Предзаказ' if is_ok else 'Пропущен (предзаказ)'})")
+        print(f"   📅 Дата релиза: {release_date} "
+              f"({'Анонс / Предзаказ' if is_ok else 'Пропущен (предзаказ)'})")
         return is_ok
+
     is_ok = days_diff <= MAX_DAYS_AGO
-    print(f"   📅 Дата релиза: {release_date} ({f'{days_diff} дн. назад' if is_ok else f'Устарел ({days_diff} дн. назад)'})")
+    status = f"{days_diff} дн. назад" if is_ok else f"Устарел ({days_diff} дн. назад)"
+    print(f"   📅 Дата релиза: {release_date} ({status})")
     return is_ok
 
 
@@ -302,7 +365,6 @@ def main():
     releases = []
     seen_links = set()
 
-    # Сбор релизов
     for target in TARGET_ARTISTS_AND_LABELS:
         if target.strip():
             for r in fetch_releases_from_artist(target):
