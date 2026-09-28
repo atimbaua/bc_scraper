@@ -35,12 +35,14 @@ CSV_FILE = "releases_data.csv"
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "@bc_ambient")
 
+
 def get_headers():
     return {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
     }
+
 
 def is_valid_html_response(text):
     if not text or len(text) < 100:
@@ -49,6 +51,7 @@ def is_valid_html_response(text):
     if "just a moment" in low or "enable javascript" in low or "attention required" in low or "<title>access denied</title>" in low:
         return False
     return True
+
 
 # ==============================================================================
 # РАБОТА С ФАЙЛАМИ
@@ -59,6 +62,7 @@ def init_csv_file():
             writer = csv.writer(f)
             writer.writerow([
                 "published_at_utc",
+                "release_date",
                 "genre",
                 "artist",
                 "album_title",
@@ -66,6 +70,7 @@ def init_csv_file():
                 "tags",
                 "image_url"
             ])
+
 
 def load_posted():
     if os.path.exists(POSTED_FILE):
@@ -76,12 +81,16 @@ def load_posted():
             return set()
     return set()
 
+
 def save_posted(posted_set):
     with open(POSTED_FILE, "w", encoding="utf-8") as f:
         json.dump(list(posted_set), f, ensure_ascii=False, indent=2)
 
+
 def save_to_csv(details):
     published_at_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    release_date = details.get("release_date")
+    release_date_str = release_date.strftime("%Y-%m-%d") if release_date else ""
     genre = details.get("genre", "ambient")
     artist = details.get("artist", "Неизвестный артист").strip()
     album_title = details.get("album_title", "Без названия").strip()
@@ -93,6 +102,7 @@ def save_to_csv(details):
         writer = csv.writer(f)
         writer.writerow([
             published_at_utc,
+            release_date_str,
             genre,
             artist,
             album_title,
@@ -101,76 +111,121 @@ def save_to_csv(details):
             image_url
         ])
 
+
 # ==============================================================================
 # ПАРСИНГ ДАТЫ СО СТРАНИЦЫ РЕЛИЗА
 # ==============================================================================
+def _strip_tags(text):
+    """Удаляет HTML-теги и нормализует пробелы. Полезно для regex-поиска по тексту."""
+    if not text:
+        return ""
+    text = re.sub(r'<script[^>]*>.*?</script>', ' ', text, flags=re.I | re.S)
+    text = re.sub(r'<style[^>]*>.*?</style>', ' ', text, flags=re.I | re.S)
+    text = re.sub(r'<[^>]+>', ' ', text)
+    text = html.unescape(text)
+    text = re.sub(r'\s+', ' ', text)
+    return text.strip()
+
+
 def _try_parse_date_string(d_str):
+    """Пытается распарсить дату из строки. Поддерживает множество форматов."""
     if not d_str:
         return None
-    # Очищаем от времени (например, " 00:00:00 GMT" или "T00:00:00Z")
-    d_clean = re.sub(r'\s+\d{2}:\d{2}:\d{2}.*', '', d_str).strip()
-    d_clean = d_clean.replace("Z", "").strip()
+
+    s = str(d_str).strip()
+    if not s:
+        return None
+
+    # Убираем время и таймзону в разных вариантах:
+    #   '2026-09-26T00:00:00Z'  ->  '2026-09-26'
+    #   '26 Sep 2026 00:00:00 GMT' -> '26 Sep 2026'
+    #   '2026-09-26T00:00:00+00:00' -> '2026-09-26'
+    s = re.sub(
+        r'[T\s]\d{1,2}:\d{2}(:\d{2})?(\.\d+)?(Z|[+\-]\d{2}:?\d{2})?.*$',
+        '',
+        s
+    ).strip()
+    s = s.rstrip('Z').strip()
+    s = s.rstrip(',').strip()
 
     formats = (
         "%d %b %Y", "%d %B %Y",
         "%B %d, %Y", "%b %d, %Y",
-        "%Y-%m-%d", "%Y/%m/%d"
+        "%B %d %Y", "%b %d %Y",
+        "%Y-%m-%d", "%Y/%m/%d",
+        "%d.%m.%Y", "%d-%m-%Y",
+        "%Y.%m.%d",
     )
     for fmt in formats:
         try:
-            return datetime.strptime(d_clean[:11].strip(), fmt).date()
+            return datetime.strptime(s, fmt).date()
         except ValueError:
             pass
 
-    # Поиск шаблона "DD Month YYYY" внутри строки
-    match_dmy = re.search(r'(\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4})', d_str)
-    if match_dmy:
-        sub_str = match_dmy.group(1)
-        for fmt in ("%d %b %Y", "%d %B %Y"):
-            try:
-                return datetime.strptime(sub_str, fmt).date()
-            except ValueError:
-                pass
-
-    # Поиск шаблона "Month DD, YYYY"
-    match_mdy = re.search(r'([A-Za-z]+\s+\d{1,2},\s+\d{4})', d_str)
-    if match_mdy:
-        sub_str = match_mdy.group(1)
-        for fmt in ("%B %d, %Y", "%b %d, %Y"):
-            try:
-                return datetime.strptime(sub_str, fmt).date()
-            except ValueError:
-                pass
+    # Fallback: ищем подстроку с датой внутри произвольного текста
+    for pat, fmts in (
+        (r'(\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4})', ("%d %b %Y", "%d %B %Y")),
+        (r'([A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4})', ("%B %d, %Y", "%b %d, %Y", "%B %d %Y", "%b %d %Y")),
+        (r'(\d{4}-\d{2}-\d{2})', ("%Y-%m-%d",)),
+        (r'(\d{4}/\d{2}/\d{2})', ("%Y/%m/%d",)),
+    ):
+        m = re.search(pat, str(d_str))
+        if m:
+            for fmt in fmts:
+                try:
+                    return datetime.strptime(m.group(1), fmt).date()
+                except ValueError:
+                    pass
 
     return None
 
+
+def _find_date_in_dict(d, keys=("release_date", "album_release_date",
+                                "original_release_date", "publish_date",
+                                "datePublished", "releaseDate")):
+    """Рекурсивно ищет дату в словаре/списке по заданным ключам."""
+    if isinstance(d, dict):
+        for k, v in d.items():
+            if k in keys and v:
+                parsed = _try_parse_date_string(str(v))
+                if parsed:
+                    return parsed
+        for v in d.values():
+            found = _find_date_in_dict(v, keys)
+            if found:
+                return found
+    elif isinstance(d, list):
+        for item in d:
+            found = _find_date_in_dict(item, keys)
+            if found:
+                return found
+    return None
+
+
 def parse_date_from_html(html_text):
+    """Извлекает дату релиза из HTML страницы Bandcamp.
+
+    Порядок проверок: от самых надёжных источников к самым хрупким.
+    """
     if not html_text:
         return None
 
-    clean_html = re.sub(r'\s+', ' ', html_text)
-
-    # 0. Поиск в атрибуте data-tralbum (Главный источник дат на Bandcamp альбомах/треках)
-    tralbum_attr_match = re.search(r'data-tralbum="([^"]+)"', html_text)
-    if tralbum_attr_match:
+    # ------------------------------------------------------------------
+    # 1. data-tralbum (главный источник, есть практически всегда)
+    # ------------------------------------------------------------------
+    tralbum_match = re.search(r'data-tralbum=["\']([^"\']+)["\']', html_text)
+    if tralbum_match:
         try:
-            tr_json = json.loads(html.unescape(tralbum_attr_match.group(1)))
-            # Проверяем ключи дат в корне и внутри словаря "current"
-            for key in ["release_date", "current_release_date", "original_release_date"]:
-                if key in tr_json and tr_json[key]:
-                    parsed = _try_parse_date_string(str(tr_json[key]))
-                    if parsed:
-                        return parsed
-            if "current" in tr_json and isinstance(tr_json["current"], dict):
-                for key in ["release_date", "current_release_date"]:
-                    if key in tr_json["current"] and tr_json["current"][key]:
-                        parsed = _try_parse_date_string(str(tr_json["current"][key]))
-                        if parsed:
-                            return parsed
+            tr_json = json.loads(html.unescape(tralbum_match.group(1)))
+            parsed = _find_date_in_dict(tr_json)
+            if parsed:
+                return parsed
         except Exception:
             pass
 
-    # 1. Поиск в JSON-LD (<script type="application/ld+json">)
+    # ------------------------------------------------------------------
+    # 2. JSON-LD (Schema.org MusicAlbum)
+    # ------------------------------------------------------------------
     ld_matches = re.findall(
         r'<script[^>]*type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
         html_text,
@@ -181,67 +236,221 @@ def parse_date_from_html(html_text):
             ld_data = json.loads(ld_raw.strip())
             items = ld_data if isinstance(ld_data, list) else [ld_data]
             for item in items:
+                if not isinstance(item, dict):
+                    continue
                 date_str = item.get("datePublished") or item.get("releaseDate")
                 if date_str:
                     parsed = _try_parse_date_string(str(date_str))
                     if parsed:
                         return parsed
+                # иногда вложено в @graph
+                graph = item.get("@graph")
+                if isinstance(graph, list):
+                    for g in graph:
+                        if isinstance(g, dict):
+                            ds = g.get("datePublished") or g.get("releaseDate")
+                            if ds:
+                                parsed = _try_parse_date_string(str(ds))
+                                if parsed:
+                                    return parsed
         except Exception:
             pass
 
-    # 2. Поиск в JS-переменных TrAlbumData
-    tr_matches = re.findall(r'(?:album_release_date|release_date|current_release_date)"?\s*:\s*"([^"]+)"', clean_html, re.IGNORECASE)
-    for raw_date_str in tr_matches:
-        parsed = _try_parse_date_string(raw_date_str)
+    # ------------------------------------------------------------------
+    # 3. <time datetime="...">
+    # ------------------------------------------------------------------
+    for dt in re.findall(r'<time[^>]*datetime=["\']([^"\']+)["\']', html_text, re.I):
+        parsed = _try_parse_date_string(dt)
         if parsed:
             return parsed
 
-    # 3. Поиск стандартного текста "released Month DD, YYYY" / "releases Month DD, YYYY"
-    date_match = re.search(r'(?:released|releases)\s+([A-Za-z]+\s+\d{1,2},\s+\d{4})', clean_html, re.IGNORECASE)
-    if date_match:
-        parsed = _try_parse_date_string(date_match.group(1))
-        if parsed:
-            return parsed
+    # ------------------------------------------------------------------
+    # 4. <meta name="bc-page-properties"> (JSON)
+    # ------------------------------------------------------------------
+    props = re.search(
+        r'<meta\s+name=["\']bc-page-properties["\']\s+content=["\']([^"\']+)["\']',
+        html_text, re.I
+    )
+    if props:
+        try:
+            props_json = json.loads(html.unescape(props.group(1)))
+            parsed = _find_date_in_dict(props_json)
+            if parsed:
+                return parsed
+        except Exception:
+            pass
 
-    # 4. Поиск "released DD Month YYYY"
-    date_match_alt = re.search(r'(?:released|releases)\s+(\d{1,2}\s+[A-Za-z]+\s+\d{4})', clean_html, re.IGNORECASE)
-    if date_match_alt:
-        parsed = _try_parse_date_string(date_match_alt.group(1))
-        if parsed:
-            return parsed
+    # ------------------------------------------------------------------
+    # 5. Блок tralbum-credits (по тексту без тегов)
+    # ------------------------------------------------------------------
+    credits = re.search(
+        r'class=["\'][^"\']*tralbum-credits[^"\']*["\'][^>]*>(.*?)</div>',
+        html_text, re.I | re.S
+    )
+    if credits:
+        block_text = _strip_tags(credits.group(1))
+        m = re.search(
+            r'released?\s+(?:on\s+)?([A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4}|\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4})',
+            block_text, re.I
+        )
+        if m:
+            parsed = _try_parse_date_string(m.group(1))
+            if parsed:
+                return parsed
 
-    # 5. Поиск itemprop="datePublished"
-    meta_dp = re.search(r'itemprop="datePublished"\s+content="([^"]+)"', clean_html, re.IGNORECASE)
+    # ------------------------------------------------------------------
+    # 6. og:description и meta[name=description]
+    # ------------------------------------------------------------------
+    for meta_re in (
+        r'<meta\s+property=["\']og:description["\']\s+content=["\']([^"\']+)["\']',
+        r'<meta\s+name=["\']description["\']\s+content=["\']([^"\']+)["\']',
+    ):
+        m = re.search(meta_re, html_text, re.I)
+        if m:
+            desc = html.unescape(m.group(1))
+            dm = re.search(
+                r'released?\s+(?:on\s+)?([A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4}|\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4})',
+                desc, re.I
+            )
+            if dm:
+                parsed = _try_parse_date_string(dm.group(1))
+                if parsed:
+                    return parsed
+
+    # ------------------------------------------------------------------
+    # 7. Общий regex по тексту без тегов ("released ...")
+    # ------------------------------------------------------------------
+    text_only = _strip_tags(html_text)
+    for pat in (
+        r'released?\s+(?:on\s+)?([A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4})',
+        r'released?\s+(?:on\s+)?(\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4})',
+    ):
+        m = re.search(pat, text_only, re.I)
+        if m:
+            parsed = _try_parse_date_string(m.group(1))
+            if parsed:
+                return parsed
+
+    # ------------------------------------------------------------------
+    # 8. itemprop="datePublished"
+    # ------------------------------------------------------------------
+    meta_dp = re.search(
+        r'itemprop=["\']datePublished["\'][^>]*content=["\']([^"\']+)["\']',
+        html_text, re.I
+    )
     if meta_dp:
         parsed = _try_parse_date_string(meta_dp.group(1))
         if parsed:
             return parsed
+    # обратный порядок атрибутов
+    meta_dp2 = re.search(
+        r'content=["\']([^"\']+)["\'][^>]*itemprop=["\']datePublished["\']',
+        html_text, re.I
+    )
+    if meta_dp2:
+        parsed = _try_parse_date_string(meta_dp2.group(1))
+        if parsed:
+            return parsed
+
+    # ------------------------------------------------------------------
+    # 9. JS-переменные (последний резерв)
+    # ------------------------------------------------------------------
+    for raw_date_str in re.findall(
+        r'(?:album_release_date|release_date|current_release_date|original_release_date)'
+        r'"?\s*[:=]\s*"([^"]+)"',
+        html_text, re.I
+    ):
+        parsed = _try_parse_date_string(raw_date_str)
+        if parsed:
+            return parsed
 
     return None
-    
-def fetch_release_date(url):
+
+
+def _extract_ids_from_tralbum(html_text):
+    """Достаёт tralbum_id и band_id из data-tralbum для fallback через API."""
+    m = re.search(r'data-tralbum=["\']([^"\']+)["\']', html_text)
+    if not m:
+        return None, None
+    try:
+        tr = json.loads(html.unescape(m.group(1)))
+    except Exception:
+        return None, None
+
+    current = tr.get("current") or {}
+    tralbum_id = current.get("id") or tr.get("id")
+    band_id = current.get("band_id") or tr.get("band_id")
+    return tralbum_id, band_id
+
+
+def fetch_release_date_via_api(tralbum_id, band_id, tralbum_type="a"):
+    """Fallback: мобильное API Bandcamp, если HTML не отдал дату."""
+    if not tralbum_id or not band_id:
+        return None
+    url = (
+        f"https://bandcamp.com/api/mobile/24/tralbum_details"
+        f"?band_id={band_id}&tralbum_id={tralbum_id}&tralbum_type={tralbum_type}"
+    )
+    try:
+        r = requests.get(url, headers=get_headers(), timeout=15)
+        if r.status_code != 200:
+            return None
+        data = r.json()
+        parsed = _find_date_in_dict(data)
+        if parsed:
+            return parsed
+    except Exception:
+        pass
+    return None
+
+
+def fetch_html(url, referer=None, timeout_html=30, timeout_req=20):
+    """Двухступенчатый fetch: curl_cffi → requests. Возвращает HTML или ''."""
     headers = get_headers()
+    if referer:
+        headers["Referer"] = referer
+
     html_text = ""
 
-    # 1. Попытка через curl_cffi (обход Cloudflare)
     if CURL_CFFI_AVAILABLE:
         try:
-            res = curl_requests.get(url, headers=headers, impersonate="chrome120", timeout=30)
+            res = curl_requests.get(
+                url, headers=headers, impersonate="chrome120", timeout=timeout_html
+            )
             if res.status_code == 200 and is_valid_html_response(res.text):
                 html_text = res.text
         except Exception as e:
-            print(f"   ⚠️ Ошибка fetch_release_date (curl_cffi): {e}")
+            print(f"   ⚠️ curl_cffi: {e}")
 
-    # 2. Резервная попытка через стандартный requests
     if not html_text:
         try:
-            res = requests.get(url, headers=headers, timeout=20)
+            res = requests.get(url, headers=headers, timeout=timeout_req)
             if res.status_code == 200 and is_valid_html_response(res.text):
                 html_text = res.text
         except Exception as e:
-            print(f"   ⚠️ Ошибка fetch_release_date (requests): {e}")
+            print(f"   ⚠️ requests: {e}")
 
-    return parse_date_from_html(html_text)
+    return html_text
+
+
+def fetch_release_date(url):
+    html_text = fetch_html(url)
+    if not html_text:
+        return None
+
+    parsed = parse_date_from_html(html_text)
+    if parsed:
+        return parsed
+
+    # Fallback: мобильное API
+    tralbum_id, band_id = _extract_ids_from_tralbum(html_text)
+    if tralbum_id and band_id:
+        parsed = fetch_release_date_via_api(tralbum_id, band_id)
+        if parsed:
+            return parsed
+
+    return None
+
 
 def is_release_date_valid(release_date):
     if release_date is None:
@@ -261,6 +470,7 @@ def is_release_date_valid(release_date):
         status = f"{days_diff} дн. назад" if is_ok else f"Устарел ({days_diff} дн. назад)"
         print(f"   📅 Дата релиза: {release_date} ({status})")
         return is_ok
+
 
 # ==============================================================================
 # ПАРСИНГ ЖАНРОВ / ТЕГОВ BANDCAMP
@@ -402,24 +612,7 @@ def fetch_from_genre(genre):
     if not raw_items:
         print(f"   ℹ️ Переход к резервному парсингу страницы https://bandcamp.com/tag/{genre_clean}...")
         tag_url = f"https://bandcamp.com/tag/{genre_clean}?sort_field=date"
-        html_headers = get_headers()
-        html_text = ""
-
-        if CURL_CFFI_AVAILABLE:
-            try:
-                res = curl_requests.get(tag_url, headers=html_headers, impersonate="chrome120", timeout=20)
-                if res.status_code == 200 and is_valid_html_response(res.text):
-                    html_text = res.text
-            except Exception:
-                pass
-
-        if not html_text:
-            try:
-                res = requests.get(tag_url, headers=html_headers, timeout=20)
-                if res.status_code == 200 and is_valid_html_response(res.text):
-                    html_text = res.text
-            except Exception:
-                pass
+        html_text = fetch_html(tag_url)
 
         if html_text:
             blob_match = re.search(r'data-blob="([^"]+)"', html_text)
@@ -456,7 +649,10 @@ def fetch_from_genre(genre):
                     print(f"   ⚠️ Ошибка извлечения data-blob: {e}")
 
             if not raw_items:
-                found_links = re.findall(r'https://[a-zA-Z0-9\-_]+\.bandcamp\.com/(?:album|track)/[a-zA-Z0-9\-_]+', html_text, re.IGNORECASE)
+                found_links = re.findall(
+                    r'https://[a-zA-Z0-9\-_]+\.bandcamp\.com/(?:album|track)/[a-zA-Z0-9\-_]+',
+                    html_text, re.IGNORECASE
+                )
                 for full_link in found_links:
                     clean_link = full_link.split('?')[0]
                     if clean_link not in seen_links:
@@ -477,6 +673,7 @@ def fetch_from_genre(genre):
     print(f"   Найдено релизов по жанру '{genre_clean}': {len(raw_items)}")
     return raw_items
 
+
 # ==============================================================================
 # ПАРСИНГ АРТИСТОВ / ЛЕЙБЛОВ
 # ==============================================================================
@@ -486,6 +683,7 @@ def extract_subdomain(target):
     target = target.split('.')[0]
     target = target.split('/')[0]
     return target
+
 
 def fetch_from_artist_or_label(target):
     subdomain = extract_subdomain(target)
@@ -592,6 +790,7 @@ def fetch_from_artist_or_label(target):
     print(f"   Найдено всего релизов в каталоге {artist_name}: {len(raw_items)}")
     return raw_items
 
+
 # ==============================================================================
 # ОТПРАВКА В TELEGRAM
 # ==============================================================================
@@ -610,8 +809,14 @@ def send_to_telegram(release):
         tags_list.insert(0, main_hashtag)
     tags_str = " ".join(tags_list)
 
+    release_date = release.get("release_date")
+    date_line = ""
+    if release_date:
+        date_line = f"📅 Дата релиза: <b>{release_date.strftime('%d %b %Y')}</b>\n\n"
+
     caption = (
         f"🌌 <b>{title}</b>\n\n"
+        f"{date_line}"
         f"📝 <i>{desc}</i>\n\n"
         f"🏷️ {tags_str}\n\n"
         f"🔗 <a href=\"{release['link']}\">Слушать / Купить на Bandcamp</a>"
@@ -640,6 +845,7 @@ def send_to_telegram(release):
     except Exception as e:
         print(f"❌ Ошибка отправки в Telegram: {e}")
         return False
+
 
 # ==============================================================================
 # MAIN
@@ -684,6 +890,10 @@ def main():
     for release in new_releases:
         print(f"   🔎 Запрос даты: {release['title_full']}...")
         release["release_date"] = fetch_release_date(release["link"])
+        if release["release_date"]:
+            print(f"      ✅ Найдена: {release['release_date']}")
+        else:
+            print(f"      ❌ Не найдена")
         time.sleep(1)
 
     new_releases.sort(
@@ -719,6 +929,7 @@ def main():
 
     save_posted(posted)
     print(f"\n🏁 Завершено. Опубликовано новых релизов: {new_posts}")
+
 
 if __name__ == "__main__":
     main()
