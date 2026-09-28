@@ -19,21 +19,20 @@ except ImportError:
 # ==============================================================================
 # 1. Жанры для поиска
 GENRES = [
-    # "ambient"
+    "ambient"
 ]
 
 # 2. Артисты и лейблы для отслеживания (поддомен или полная ссылка)
 TARGET_ARTISTS_AND_LABELS = [
     # "carbonbasedlifeforms",
     # "https://sessionvictim.bandcamp.com"
-    "https://jasonrobinson.bandcamp.com"
 ]
 
 # 3. ФИЛЬТР ПО ВРЕМЕНИ ВЫПУСКА (в часах)
 # Например: 1 = искать только релизы за последний час
 # 24 = искать релизы за последние сутки
 # None или 0 = отключить фильтрацию по времени (постить всё старое)
-MAX_RELEASE_AGE_HOURS = 24   
+MAX_RELEASE_AGE_HOURS = 2
 
 MAX_POSTS_PER_RUN = 10       # Лимит постов за 1 запуск
 POSTED_FILE = "posted_releases.json"
