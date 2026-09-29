@@ -31,7 +31,6 @@
 ├── bot_scraper.py            # Основной код парсера и Telegram-бота
 ├── posted_releases.json      # Список уже опубликованных ссылок (JSON)
 ├── releases_data.csv         # Накопленная база данных релизов (CSV)
-├── requirements.txt          # Зависимости Python
 └── README.md                 # Документация проекта
 ```
 
@@ -52,7 +51,20 @@ TARGET_ARTISTS_AND_LABELS = [
     "solarfields"
 ]
 
-MAX_POSTS_PER_RUN = 3       # Лимит постов за 1 запуск
+MAX_DAYS_AGO = 2          # публиковать не старше N дней
+ALLOW_UPCOMING = True     # включать предзаказы
+
+MAX_POSTS_PER_RUN = 5     # лимит публикаций за один запуск
+
+DELAY_BETWEEN_RELEASES = (1.0, 2.0)   # пауза между релизами (сек)
+DELAY_BETWEEN_PAGES = (2.0, 3.5)      # пауза между страницами артиста
+
+MAX_GENRE_RELEASES = 60   # максимум кандидатов по жанру
+MAX_PAGES_PER_ARTIST = 30 # максимум страниц /music
+
+# True  — даты берутся из Discover API (быстро, один запрос)
+# False — даты парсятся со страниц релизов (медленно, точные релизные даты)
+GENRE_USE_API_DATE = True
 ```
 
 ---
