@@ -535,118 +535,108 @@ def fetch_releases_from_artist(target):
 # ПАРСИНГ ЖАНРОВ / ТЕГОВ
 # ==============================================================================
 def _collect_genre_candidates(genre, session):
-    """Собирает кандидатов-релизов по жанру.
-
-    Порядок источников:
-      1. HTML /tag/<genre>?sort_field=date — извлекаем data-blob JSON и ссылки
-      2. Discover API — /api/discover/3/get_web и get_cards
-    """
+    """Собирает кандидатов-релизов по жанру через API Discover."""
     candidates = []
     seen = set()
 
-    # --- Источник 1: HTML страница тега с сортировкой по дате ---
-    tag_url = f"https://bandcamp.com/tag/{genre}?sort_field=date"
-    print(f"   📄 {tag_url}")
-
-    html_text = ""
+    # --- Источник 1: API Discover ---
+    print(f"   🔎 Запрос к API Discover для жанра '{genre}'...")
+    api_url = f"https://bandcamp.com/api/discover/3/get_web?p=0&s=new&g={genre}&f=all"
+    
     try:
-        r = session.get(tag_url, headers=_headers_html(), timeout=30)
+        r = session.get(api_url, headers=_headers_json(), timeout=20)
         if r.status_code == 200:
-            html_text = r.text
-        else:
-            print(f"      ⚠️ HTTP {r.status_code}")
-    except Exception as e:
-        print(f"      ⚠️ {e}")
-
-    if html_text:
-        # 1.1 data-blob JSON
-        blob_m = re.search(r'data-blob="([^"]+)"', html_text)
-        if blob_m:
             try:
-                blob = json.loads(html_mod.unescape(blob_m.group(1)))
-                items = (
-                    blob.get("hub_data", {}).get("dig_deeper", {}).get("items", [])
-                    or blob.get("tab_data", {}).get("dig_deeper", {}).get("items", [])
-                    or blob.get("dig_deeper", {}).get("items", [])
-                    or blob.get("items", [])
-                    or blob.get("results", [])
-                )
+                data = r.json()
+                # Данные могут приходить в разных полях: items, results, cards
+                items = data.get("items") or data.get("results") or data.get("cards") or []
                 for it in items:
-                    link = it.get("tralbum_url") or it.get("link") or it.get("page_url")
+                    link = (
+                        it.get("tralbum_url") or
+                        it.get("url") or
+                        it.get("page_url") or
+                        it.get("link")
+                    )
                     if not link:
                         continue
                     link = link.split("?")[0]
-                    if not link.startswith("http") or link in seen:
+                    if link in seen:
                         continue
                     seen.add(link)
                     candidates.append({
                         "link": link,
-                        "title": it.get("title") or it.get("primary_text") or it.get("album_title") or "",
-                        "artist": it.get("artist_name") or it.get("artist") or it.get("secondary_text") or "",
-                        "image": it.get("image") or it.get("album_art") or "",
+                        "title": it.get("album_title") or it.get("title") or it.get("primary_text") or "",
+                        "artist": it.get("band_name") or it.get("artist") or it.get("secondary_text") or "",
+                        "image": it.get("album_art") or it.get("image") or "",
                     })
             except Exception as e:
-                print(f"      ⚠️ data-blob: {e}")
+                print(f"      ⚠️ Ошибка парсинга JSON: {e}")
+        else:
+            print(f"      ⚠️ HTTP {r.status_code}")
+    except Exception as e:
+        print(f"      ⚠️ Ошибка запроса: {e}")
 
-        # 1.2 Прямой regex по ссылкам на релизы
-        if not candidates:
-            for m in re.finditer(
-                r'https://[a-zA-Z0-9\-_]+\.bandcamp\.com/(?:album|track)/[a-zA-Z0-9\-_]+',
-                html_text
-            ):
-                link = m.group(0).split("?")[0]
-                if link in seen:
-                    continue
-                seen.add(link)
-                candidates.append({"link": link, "title": "", "artist": "", "image": ""})
+    if candidates:
+        print(f"      ✅ Найдено {len(candidates)} кандидатов через API")
+        return candidates[:MAX_GENRE_RELEASES]
 
-    # --- Источник 2: Discover API ---
-    if not candidates:
-        print(f"   🔎 Fallback: discover API...")
-        api_urls = [
-            f"https://bandcamp.com/api/discover/3/get_web?g={genre}&s=new&p=0&f=all",
-            f"https://bandcamp.com/api/discover/3/get_cards?g={genre}&s=new&p=0&f=all",
-            f"https://bandcamp.com/api/discover/3/get_web?g={genre}&s=top&p=0&f=all",
-        ]
-        for api_url in api_urls:
-            try:
-                r = session.get(api_url, headers=_headers_json(), timeout=20)
-                if r.status_code != 200:
-                    continue
+    # --- Источник 2: HTML-страница Discover (fallback) ---
+    print(f"   📄 Fallback: парсинг HTML страницы discover...")
+    html_url = f"https://bandcamp.com/discover/{genre}?s=new&p=digital"
+    try:
+        r = session.get(html_url, headers=_headers_html(), timeout=30)
+        if r.status_code == 200:
+            html_text = r.text
+            # Пытаемся найти data-blob
+            blob_m = re.search(r'data-blob="([^"]+)"', html_text)
+            if blob_m:
                 try:
-                    data = r.json()
-                except Exception:
-                    continue
-            except Exception:
-                continue
+                    blob = json.loads(html_mod.unescape(blob_m.group(1)))
+                    # Ищем items в разных местах blob
+                    items = (
+                        blob.get("hub_data", {}).get("dig_deeper", {}).get("items", [])
+                        or blob.get("tab_data", {}).get("dig_deeper", {}).get("items", [])
+                        or blob.get("dig_deeper", {}).get("items", [])
+                        or blob.get("items", [])
+                        or blob.get("results", [])
+                    )
+                    for it in items:
+                        link = it.get("tralbum_url") or it.get("link") or it.get("page_url")
+                        if not link:
+                            continue
+                        link = link.split("?")[0]
+                        if link in seen:
+                            continue
+                        seen.add(link)
+                        candidates.append({
+                            "link": link,
+                            "title": it.get("title") or it.get("primary_text") or it.get("album_title") or "",
+                            "artist": it.get("artist_name") or it.get("artist") or it.get("secondary_text") or "",
+                            "image": it.get("image") or it.get("album_art") or "",
+                        })
+                except Exception as e:
+                    print(f"      ⚠️ data-blob: {e}")
 
-            results = (
-                data.get("results")
-                or data.get("items")
-                or data.get("cards")
-                or []
-            )
-            for it in results:
-                link = (
-                    it.get("tralbum_url")
-                    or it.get("url")
-                    or it.get("page_url")
-                    or it.get("link")
-                )
-                if not link:
-                    continue
-                link = link.split("?")[0]
-                if not link.startswith("http") or link in seen:
-                    continue
-                seen.add(link)
-                candidates.append({
-                    "link": link,
-                    "title": it.get("album_title") or it.get("title") or it.get("primary_text") or "",
-                    "artist": it.get("band_name") or it.get("artist") or it.get("secondary_text") or "",
-                    "image": it.get("album_art") or it.get("image") or "",
-                })
-            if candidates:
-                break
+            # Если blob не дал результатов, пробуем regex по ссылкам
+            if not candidates:
+                for m in re.finditer(
+                    r'https://[a-zA-Z0-9\-_]+\.bandcamp\.com/(?:album|track)/[a-zA-Z0-9\-_]+',
+                    html_text
+                ):
+                    link = m.group(0).split("?")[0]
+                    if link in seen:
+                        continue
+                    seen.add(link)
+                    candidates.append({"link": link, "title": "", "artist": "", "image": ""})
+        else:
+            print(f"      ⚠️ HTTP {r.status_code}")
+    except Exception as e:
+        print(f"      ⚠️ Ошибка: {e}")
+
+    if candidates:
+        print(f"      ✅ Найдено {len(candidates)} кандидатов через HTML")
+    else:
+        print(f"      ❌ Кандидаты не найдены")
 
     return candidates[:MAX_GENRE_RELEASES]
 
