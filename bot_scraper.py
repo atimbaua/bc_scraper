@@ -8,7 +8,7 @@ import re
 from datetime import datetime, timezone, date
 from urllib.parse import urljoin
 
-# Транспорт для py_bandcamp (обход Fastly/Cloudflare)
+# Транспорт для py_bandcamp (используется только в fallback)
 os.environ["PYBANDCAMP_TRANSPORT"] = "curl_cffi"
 
 import curl_cffi.requests as ccr
@@ -41,8 +41,7 @@ CSV_FILE = "releases_data.csv"
 DELAY_BETWEEN_RELEASES = (1.0, 2.0)
 DELAY_BETWEEN_PAGES = (2.0, 3.5)
 MAX_PAGES_PER_ARTIST = 30
-MAX_GENRE_PAGES = 3           # сколько страниц search_tag листать
-MAX_GENRE_RELEASES = 60       # максимум кандидатов по жанру
+MAX_GENRE_RELEASES = 60        # сколько кандидатов из жанра максимум обрабатывать
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "@bc_ambient")
@@ -69,6 +68,17 @@ def _headers_html():
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
         "Referer": "https://bandcamp.com/",
+    }
+
+
+def _headers_json():
+    return {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://bandcamp.com/",
+        "Origin": "https://bandcamp.com",
+        "X-Requested-With": "XMLHttpRequest",
     }
 
 
@@ -523,25 +533,150 @@ def fetch_releases_from_artist(target):
 
 
 # ==============================================================================
-# ПАРСИНГ ЖАНРОВ / ТЕГОВ — через py_bandcamp.search_tag
+# ПАРСИНГ ЖАНРОВ / ТЕГОВ — через discover_web API
 # ==============================================================================
-def _release_date_from_pybandcamp(release):
-    """Достаёт дату из объекта Release py_bandcamp.
+def _collect_genre_candidates(genre, session):
+    """Собирает кандидатов-релизов по жанру через API discover_web."""
+    candidates = []
+    seen = set()
 
-    В зависимости от версии release_date может быть:
-      - строкой ISO 'YYYY-MM-DD'
-      - pydantic-объектом IsoDate с year/month/day
-      - None
-    """
-    raw = getattr(release, "release_date", None)
-    if not raw:
-        return None
-    if hasattr(raw, "year") and hasattr(raw, "month") and hasattr(raw, "day"):
-        try:
-            return date(int(raw.year), int(raw.month), int(raw.day))
-        except Exception:
-            pass
-    return _try_parse_date_string(str(raw))
+    print(f"   🔎 POST запрос к API discover_web для жанра '{genre}'...")
+    api_url = "https://bandcamp.com/api/discover/1/discover_web"
+
+    # Параметры запроса (на основе документации и примеров)
+    payload = {
+        "filters": {
+            "format": "all",
+            "genre": genre,
+            "location": 0,
+            "sort": "new",
+            "tag_slug": genre,
+        },
+        "page": 1,
+    }
+
+    try:
+        r = session.post(
+            api_url,
+            json=payload,
+            headers={
+                **_headers_json(),
+                "Content-Type": "application/json",
+            },
+            timeout=20,
+        )
+        print(f"      HTTP {r.status_code}")
+        if r.status_code == 200:
+            try:
+                data = r.json()
+                # Ищем items в разных возможных полях ответа
+                items = (
+                    data.get("items")
+                    or data.get("results")
+                    or data.get("cards")
+                    or []
+                )
+                for it in items:
+                    link = (
+                        it.get("tralbum_url")
+                        or it.get("url")
+                        or it.get("page_url")
+                        or it.get("link")
+                    )
+                    if not link:
+                        continue
+                    link = link.split("?")[0]
+                    if link in seen:
+                        continue
+                    seen.add(link)
+                    candidates.append({
+                        "link": link,
+                        "title": (
+                            it.get("album_title")
+                            or it.get("title")
+                            or it.get("primary_text")
+                            or ""
+                        ),
+                        "artist": (
+                            it.get("band_name")
+                            or it.get("artist")
+                            or it.get("secondary_text")
+                            or ""
+                        ),
+                        "image": (
+                            it.get("album_art")
+                            or it.get("image")
+                            or ""
+                        ),
+                    })
+                print(f"      ✅ Найдено {len(candidates)} кандидатов через API")
+            except Exception as e:
+                print(f"      ⚠️ Ошибка парсинга JSON: {e}")
+                # Логируем начало ответа для отладки
+                print(f"      📄 Ответ: {r.text[:300]}")
+        else:
+            print(f"      ⚠️ HTTP {r.status_code}")
+            print(f"      📄 Ответ: {r.text[:300]}")
+    except Exception as e:
+        print(f"      ⚠️ Ошибка запроса: {e}")
+
+    if candidates:
+        return candidates[:MAX_GENRE_RELEASES]
+
+    # Fallback: попробуем HTML-страницу discover (на случай, если POST не сработал)
+    print(f"   📄 Fallback: парсинг HTML страницы discover...")
+    html_url = f"https://bandcamp.com/discover/{genre}?s=new&p=digital"
+    try:
+        r = session.get(html_url, headers=_headers_html(), timeout=30)
+        if r.status_code == 200:
+            html_text = r.text
+            # Пытаемся найти data-blob
+            blob_m = re.search(r'data-blob="([^"]+)"', html_text)
+            if blob_m:
+                try:
+                    blob = json.loads(html_mod.unescape(blob_m.group(1)))
+                    items = (
+                        blob.get("hub_data", {}).get("dig_deeper", {}).get("items", [])
+                        or blob.get("tab_data", {}).get("dig_deeper", {}).get("items", [])
+                        or blob.get("dig_deeper", {}).get("items", [])
+                        or blob.get("items", [])
+                    )
+                    for it in items:
+                        link = it.get("tralbum_url") or it.get("link") or it.get("page_url")
+                        if not link:
+                            continue
+                        link = link.split("?")[0]
+                        if link in seen:
+                            continue
+                        seen.add(link)
+                        candidates.append({
+                            "link": link,
+                            "title": it.get("title") or it.get("primary_text") or "",
+                            "artist": it.get("artist_name") or it.get("artist") or "",
+                            "image": it.get("image") or "",
+                        })
+                except Exception as e:
+                    print(f"      ⚠️ data-blob: {e}")
+
+            if not candidates:
+                for m in re.finditer(
+                    r'https://[a-zA-Z0-9\-_]+\.bandcamp\.com/(?:album|track)/[a-zA-Z0-9\-_]+',
+                    html_text
+                ):
+                    link = m.group(0).split("?")[0]
+                    if link in seen:
+                        continue
+                    seen.add(link)
+                    candidates.append({"link": link, "title": "", "artist": "", "image": ""})
+    except Exception as e:
+        print(f"      ⚠️ Ошибка: {e}")
+
+    if candidates:
+        print(f"      ✅ Найдено {len(candidates)} кандидатов через HTML")
+    else:
+        print(f"      ❌ Кандидаты не найдены")
+
+    return candidates[:MAX_GENRE_RELEASES]
 
 
 def fetch_releases_from_genre(genre):
@@ -553,91 +688,65 @@ def fetch_releases_from_genre(genre):
     releases = []
     seen_links = set()
 
-    if not PYBANDCAMP_AVAILABLE:
-        print("   ⚠️ py_bandcamp недоступен. Установите: pip install py_bandcamp")
-        return []
+    with ccr.Session(impersonate="chrome120") as session:
+        print(f"\n   ── Этап 1: сбор кандидатов ──")
+        candidates = _collect_genre_candidates(genre_clean, session)
+        print(f"   Кандидатов: {len(candidates)}")
 
-    print(f"\n   ── Этап 1: поиск через py_bandcamp.search_tag ──")
+        if not candidates:
+            print("   ⚠️ Не удалось собрать ни одного кандидата.")
+            return []
 
-    # Пробуем разные варианты вызова: с max_pages и без (для разных версий API)
-    items = []
-    try:
-        print(f"   🔎 search_tag({genre_clean!r}, albums=True, tracks=False, max_pages={MAX_GENRE_PAGES})")
-        items = list(BandCamp.search_tag(
-            genre_clean,
-            albums=True,
-            tracks=False,
-            max_pages=MAX_GENRE_PAGES,
-        ))
-    except TypeError as e:
-        # В некоторых версиях max_pages не поддерживается
-        print(f"      ⚠️ {e} — пробуем без max_pages")
-        try:
-            items = list(BandCamp.search_tag(genre_clean, albums=True, tracks=False))
-        except Exception as e2:
-            print(f"      ⚠️ search_tag: {e2}")
-            items = []
-    except Exception as e:
-        print(f"      ⚠️ search_tag: {e}")
-        items = []
+        print(f"\n   ── Этап 2: парсинг страниц релизов ──")
+        for i, cand in enumerate(candidates, 1):
+            url = cand["link"]
+            if url in seen_links:
+                continue
+            seen_links.add(url)
 
-    print(f"   Получено объектов Release: {len(items)}")
+            print(f"\n   [{i}/{len(candidates)}] {url}")
 
-    if not items:
-        print("   ⚠️ search_tag не вернул результатов.")
-        return []
+            try:
+                r = session.get(url, headers=_headers_html(), timeout=30)
+            except Exception as e:
+                print(f"      ⚠️ {e}")
+                continue
 
-    print(f"\n   ── Этап 2: обработка релизов ──")
+            if r.status_code != 200:
+                print(f"      ⚠️ HTTP {r.status_code}")
+                continue
 
-    for i, release in enumerate(items, 1):
-        if len(releases) >= MAX_GENRE_RELEASES:
-            print(f"   🛑 Достигнут лимит {MAX_GENRE_RELEASES} релизов, останавливаемся.")
-            break
+            html_text = r.text
+            release_date = parse_date_from_html(html_text)
+            if not release_date:
+                release_date = _try_pybandcamp_fallback(url)
 
-        try:
-            link = release.uri
-        except Exception:
-            link = None
+            title = _extract_title(html_text, url=url) or cand.get("title") or ""
+            image = _extract_og(html_text, "image") or cand.get("image") or ""
+            artist = (
+                _extract_artist_from_page(html_text)
+                or cand.get("artist")
+                or "Various Artists"
+            )
 
-        if not link or link in seen_links:
-            continue
-        seen_links.add(link)
+            if DEBUG:
+                print(f"      🔍 release_date = {release_date!r}, title = {title!r}")
 
-        title = "Без названия"
-        try:
-            if release.work and release.work.title:
-                title = release.work.title
-        except Exception:
-            pass
+            releases.append({
+                "title_full": f"{title} by {artist}",
+                "artist": artist,
+                "album_title": title,
+                "image": image,
+                "description": f"New release in #{genre_clean}.",
+                "tags": [genre_clean],
+                "link": url,
+                "genre": genre_clean,
+                "release_date": release_date,
+            })
 
-        artist = "Various Artists"
-        try:
-            if release.work and release.work.credits:
-                artist = release.work.credits[0].entity.name or "Various Artists"
-        except Exception:
-            pass
+            print(f"      ✅ {title} — {release_date or 'дата не найдена'}")
 
-        image = getattr(release, "image", "") or ""
-        release_date = _release_date_from_pybandcamp(release)
-
-        if DEBUG:
-            print(f"   [{i}/{len(items)}] {title} — release_date={release_date!r}")
-
-        releases.append({
-            "title_full": f"{title} by {artist}",
-            "artist": artist,
-            "album_title": title,
-            "image": image,
-            "description": f"New release in #{genre_clean}.",
-            "tags": [genre_clean],
-            "link": link,
-            "genre": genre_clean,
-            "release_date": release_date,
-        })
-
-        print(f"      ✅ {title} — {release_date or 'дата не найдена'}")
-
-        time.sleep(random.uniform(*DELAY_BETWEEN_RELEASES))
+            time.sleep(random.uniform(*DELAY_BETWEEN_RELEASES))
 
     print(f"\n   ИТОГО релизов в жанре '{genre_clean}': {len(releases)}")
     return releases
@@ -718,10 +827,6 @@ def main():
         return
 
     print("✅ Скрипт запущен (curl_cffi + HTML-парсинг дат)")
-
-    if not PYBANDCAMP_AVAILABLE:
-        print("⚠️ py_bandcamp не установлен. Установите: pip install py_bandcamp")
-        print("   Поиск по артистам продолжит работать, по жанрам — нет.")
 
     init_csv_file()
     posted = load_posted()
