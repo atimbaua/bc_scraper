@@ -1,4 +1,4 @@
-name: Bandcamp Ambient Bot Parser
+name: Bandcamp Telegram Scraper Bot
 
 on:
   schedule:
