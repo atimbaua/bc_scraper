@@ -42,6 +42,13 @@ DELAY_BETWEEN_PAGES = (2.0, 3.5)
 MAX_PAGES_PER_ARTIST = 30
 MAX_GENRE_RELEASES = 60
 
+# Если True — берём publish_date прямо из API Discover,
+# не загружая страницы релизов. Быстро, но дата = дата публикации
+# на Bandcamp (обычно совпадает с датой релиза, кроме предзаказов).
+# Если False — для каждого релиза загружаем страницу и берём
+# "официальную" release_date из data-tralbum / JSON-LD.
+GENRE_USE_API_DATE = True
+
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "@bc_ambient")
 
@@ -531,74 +538,102 @@ def fetch_releases_from_artist(target):
 
 
 # ==============================================================================
-# УНИВЕРСАЛЬНОЕ ИЗВЛЕЧЕНИЕ URL ИЗ DISCOVER API ITEM
+# ПАРСИНГ ЖАНРОВ / ТЕГОВ — через Discover API
 # ==============================================================================
-def _extract_item_link(it):
-    """Пытается извлечь URL релиза из item Discover API.
+def _build_url_from_item(it):
+    """Собирает URL релиза из item Discover API.
 
-    Поля у разных версий API могут называться по-разному. Перебираем все
-    известные варианты + склеиваем из item_url_root + item_url_path.
+    Основной источник: url_hints = {"subdomain": "...", "slug": "..."}
+    + type ('a' → album, 't' → track).
     """
-    # 1. Прямые поля с URL
-    for key in ("item_url", "tralbum_url", "url", "page_url", "link", "item_url_path"):
+    url_hints = it.get("url_hints") or {}
+    if isinstance(url_hints, str):
+        try:
+            url_hints = json.loads(url_hints)
+        except Exception:
+            url_hints = {}
+
+    subdomain = url_hints.get("subdomain")
+    slug = url_hints.get("slug")
+    item_type = it.get("type") or "a"
+
+    if subdomain and slug:
+        seg = "album" if item_type == "a" else "track"
+        return f"https://{subdomain}.bandcamp.com/{seg}/{slug}"
+
+    # Fallback: прямое поле
+    for key in ("item_url", "tralbum_url", "url", "page_url"):
         val = it.get(key)
         if isinstance(val, str) and val.startswith("http"):
             return val
 
-    # 2. Склеиваем root + path
-    root = it.get("item_url_root") or it.get("band_url")
-    path = it.get("item_url_path") or it.get("tralbum_url_path")
-    if root and path:
-        if not root.endswith("/"):
-            root += "/"
-        if path.startswith("/"):
-            path = path[1:]
-        return root + path
-
-    # 3. Собираем из band_name + item_url_path
-    band_name = it.get("band_name") or it.get("band")
-    if band_name and path:
-        if path.startswith("/"):
-            path = path[1:]
-        return f"https://{band_name}.bandcamp.com/{path}"
-
-    # 4. Через tralbum_id + band_id (обратим в URL через поиск нельзя,
-    #    но можно собрать if we have band_name and tralbum_type)
-    tralbum_id = it.get("tralbum_id") or it.get("id")
-    tralbum_type = it.get("tralbum_type") or it.get("type")
-    if band_name and tralbum_id and tralbum_type:
-        # tralbum_type: 'a' → album, 't' → track
-        seg = "album" if tralbum_type in ("a", "album") else "track"
-        # slug неизвестен, оставим без него — Bandcamp редиректит /album/12345
-        return f"https://{band_name}.bandcamp.com/{seg}/{tralbum_id}"
-
-    # 5. Поле с относительным путём в '/' виде
-    for key in ("item_url_path", "tralbum_url_path", "path"):
-        val = it.get(key)
-        if isinstance(val, str) and val.startswith("/"):
-            return val  # вернём как относительный, дособерём ниже
-
     return None
 
 
-def _dump_item_structure(it, label="item"):
-    """Печатает все ключи и значения (обрезанные) для отладки."""
-    print(f"      🔬 Структура {label}:")
-    for k, v in it.items():
-        if isinstance(v, (dict, list)):
-            s = json.dumps(v, ensure_ascii=False)
-            if len(s) > 120:
-                s = s[:117] + "..."
-            print(f"         • {k}: {s}")
-        else:
-            sv = str(v)
-            if len(sv) > 120:
-                sv = sv[:117] + "..."
-            print(f"         • {k}: {sv!r}")
+def _items_to_candidates(items):
+    """Преобразует сырые items Discover API в кандидатов.
+
+    Из каждого item забираем:
+      - ссылку (из url_hints)
+      - название (primary_text)
+      - артиста (secondary_text)
+      - обложку (art_id)
+      - дату публикации (publish_date)
+    """
+    candidates = []
+    seen = set()
+
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+
+        link = _build_url_from_item(it)
+        if not link:
+            continue
+
+        # Проверяем, что это релиз/трек, а не что-то другое
+        if not re.match(
+            r'https?://[a-zA-Z0-9\-_]+\.bandcamp\.com/(album|track)/[a-zA-Z0-9_\-]+',
+            link
+        ):
+            continue
+
+        if link in seen:
+            continue
+        seen.add(link)
+
+        title = (
+            it.get("primary_text")
+            or it.get("album_title")
+            or it.get("title")
+            or ""
+        )
+        artist = (
+            it.get("secondary_text")
+            or it.get("band_name")
+            or it.get("artist")
+            or ""
+        )
+
+        art_id = it.get("art_id") or it.get("item_art_id")
+        image = f"https://f4.bcbits.com/img/a{art_id}_10.jpg" if art_id else ""
+
+        # Дата публикации прямо из API
+        api_date = _try_parse_date_string(it.get("publish_date") or "")
+
+        candidates.append({
+            "link": link,
+            "title": title,
+            "artist": artist,
+            "image": image,
+            "api_date": api_date,
+        })
+
+    return candidates[:MAX_GENRE_RELEASES]
 
 
 def _try_get_web_api(genre, session):
-    """Старый GET-эндпоинт /api/discover/3/get_web."""
+    """GET /api/discover/3/get_web — рабочий эндпоинт."""
     print(f"   🔎 GET /api/discover/3/get_web")
     url = f"https://bandcamp.com/api/discover/3/get_web?p=0&s=new&g={genre}&f=all"
     try:
@@ -616,135 +651,35 @@ def _try_get_web_api(genre, session):
         print(f"      items: {len(items)}")
 
         if items and DEBUG:
-            _dump_item_structure(items[0], label="items[0]")
+            # Короткий дамп первого item для отладки
+            first = items[0]
+            for k in ("type", "id", "primary_text", "secondary_text",
+                      "art_id", "publish_date", "url_hints", "is_preorder"):
+                if k in first:
+                    v = first[k]
+                    sv = json.dumps(v, ensure_ascii=False) if isinstance(v, (dict, list)) else str(v)
+                    if len(sv) > 100:
+                        sv = sv[:97] + "..."
+                    print(f"         • {k}: {sv!r}")
 
         return items
     except Exception as e:
         print(f"      ⚠️ {e}")
         return []
-
-
-def _try_discover_web_api(genre, session):
-    """POST /api/discover/1/discover_web — на случай, если get_web отвалится."""
-    print(f"   🔎 POST /api/discover/1/discover_web")
-    payload = {
-        "filters": {
-            "format": "all",
-            "genre": genre,
-            "location": 0,
-            "sort": "new",
-            "tag_slug": genre,
-        },
-        "page": 1,
-    }
-    try:
-        r = session.post(
-            "https://bandcamp.com/api/discover/1/discover_web",
-            json=payload,
-            headers={**_headers_json(), "Content-Type": "application/json"},
-            timeout=20,
-        )
-        print(f"      HTTP {r.status_code}, len={len(r.text)}")
-        if r.status_code != 200:
-            return []
-        try:
-            data = r.json()
-        except Exception:
-            return []
-        items = data.get("items") or data.get("results") or data.get("cards") or []
-        print(f"      items: {len(items)}")
-        if items and DEBUG:
-            _dump_item_structure(items[0], label="items[0]")
-        return items
-    except Exception as e:
-        print(f"      ⚠️ {e}")
-        return []
-
-
-def _items_to_candidates(items):
-    """Преобразует сырые items Discover API в кандидатов."""
-    candidates = []
-    seen = set()
-
-    for it in items:
-        if not isinstance(it, dict):
-            continue
-
-        link = _extract_item_link(it)
-        if not link:
-            continue
-
-        # Если URL относительный — пропускаем, не знаем базы
-        if not link.startswith("http"):
-            continue
-
-        # Отсекаем мусорные ссылки на bandcamp.com (жанровые/промо)
-        if "bandcamp.com/" in link and not re.match(
-            r'https?://[a-zA-Z0-9\-_]+\.bandcamp\.com/(album|track)/',
-            link
-        ):
-            continue
-
-        if link in seen:
-            continue
-        seen.add(link)
-
-        # Название
-        title = (
-            it.get("album_title")
-            or it.get("title")
-            or it.get("primary_text")
-            or ""
-        )
-
-        # Артист
-        artist = (
-            it.get("band_name")
-            or it.get("artist")
-            or it.get("secondary_text")
-            or ""
-        )
-
-        # Картинка
-        art_id = it.get("item_art_id") or it.get("art_id")
-        image = ""
-        if art_id:
-            image = f"https://f4.bcbits.com/img/a{art_id}_10.jpg"
-        elif it.get("image"):
-            image = it["image"]
-
-        candidates.append({
-            "link": link,
-            "title": title,
-            "artist": artist,
-            "image": image,
-        })
-
-    return candidates[:MAX_GENRE_RELEASES]
 
 
 def _collect_genre_candidates(genre, session):
-    """Пробует стратегии по очереди, возвращает первых, кто дал результат."""
-    # Стратегия 1: старый get_web (по логу — работает)
+    """Собирает кандидатов через Discover API."""
     items = _try_get_web_api(genre, session)
-    if items:
-        candidates = _items_to_candidates(items)
-        print(f"      → извлечено кандидатов: {len(candidates)}")
-        if candidates:
-            return candidates
-        else:
-            print(f"      ⚠️ items есть, но URL из них не извлеклись — см. дамп выше")
+    if not items:
+        print("   ⚠️ Discover API не вернул items.")
+        return []
 
-    # Стратегия 2: POST discover_web
-    print(f"\n   ── Пробуем POST discover_web ──")
-    items = _try_discover_web_api(genre, session)
-    if items:
-        candidates = _items_to_candidates(items)
-        print(f"      → извлечено кандидатов: {len(candidates)}")
-        if candidates:
-            return candidates
-
-    return []
+    candidates = _items_to_candidates(items)
+    print(f"      → извлечено кандидатов: {len(candidates)}")
+    if not candidates:
+        print("   ⚠️ items есть, но URL из них не извлеклись. Проверьте дамп выше.")
+    return candidates
 
 
 def fetch_releases_from_genre(genre):
@@ -765,7 +700,39 @@ def fetch_releases_from_genre(genre):
             print("   ⚠️ Не удалось собрать ни одного кандидата.")
             return []
 
-        print(f"\n   ── Этап 2: парсинг страниц релизов ──")
+        # --- Быстрый путь: дата уже в API, страницы не грузим ---
+        if GENRE_USE_API_DATE:
+            print(f"\n   ── Этап 2 (быстрый): используем publish_date из API ──")
+            for i, cand in enumerate(candidates, 1):
+                url = cand["link"]
+                if url in seen_links:
+                    continue
+                seen_links.add(url)
+
+                title = cand.get("title") or _title_from_url(url)
+                artist = cand.get("artist") or "Various Artists"
+                image = cand.get("image") or ""
+                release_date = cand.get("api_date")
+
+                releases.append({
+                    "title_full": f"{title} by {artist}",
+                    "artist": artist,
+                    "album_title": title,
+                    "image": image,
+                    "description": f"New release in #{genre_clean}.",
+                    "tags": [genre_clean],
+                    "link": url,
+                    "genre": genre_clean,
+                    "release_date": release_date,
+                })
+
+                print(f"   [{i}/{len(candidates)}] {title} — {release_date or 'дата не найдена'}")
+
+            print(f"\n   ИТОГО релизов в жанре '{genre_clean}': {len(releases)}")
+            return releases
+
+        # --- Медленный путь: грузим каждую страницу и парсим "официальную" дату ---
+        print(f"\n   ── Этап 2 (полный): загрузка страниц релизов ──")
         for i, cand in enumerate(candidates, 1):
             url = cand["link"]
             if url in seen_links:
@@ -789,6 +756,7 @@ def fetch_releases_from_genre(genre):
             if not release_date:
                 release_date = _try_pybandcamp_fallback(url)
 
+            # Fallback на данные из API
             title = _extract_title(html_text, url=url) or cand.get("title") or ""
             image = _extract_og(html_text, "image") or cand.get("image") or ""
             artist = (
@@ -796,6 +764,9 @@ def fetch_releases_from_genre(genre):
                 or cand.get("artist")
                 or "Various Artists"
             )
+
+            if not release_date:
+                release_date = cand.get("api_date")
 
             if DEBUG:
                 print(f"      🔍 release_date = {release_date!r}, title = {title!r}")
