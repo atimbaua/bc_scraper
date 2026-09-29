@@ -34,13 +34,14 @@ TARGET_ARTISTS_AND_LABELS = [
 MAX_DAYS_AGO = 2
 ALLOW_UPCOMING = True
 
-MAX_POSTS_PER_RUN = 3
+MAX_POSTS_PER_RUN = 5
 POSTED_FILE = "posted_releases.json"
 CSV_FILE = "releases_data.csv"
 
-DELAY_BETWEEN_RELEASES = (2.0, 4.0)
-DELAY_BETWEEN_PAGES = (3.0, 5.0)
+DELAY_BETWEEN_RELEASES = (1.0, 2.0)
+DELAY_BETWEEN_PAGES = (2.0, 3.5)
 MAX_PAGES_PER_ARTIST = 30
+MAX_GENRE_RELEASES = 40        # сколько кандидатов из жанра максимум обрабатывать
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "@bc_ambient")
@@ -57,6 +58,28 @@ CF_TITLE_MARKERS = (
     "please wait",
     "ddos protection",
 )
+
+# ==============================================================================
+# HTTP-ЗАГОЛОВКИ
+# ==============================================================================
+def _headers_html():
+    return {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://bandcamp.com/",
+    }
+
+
+def _headers_json():
+    return {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://bandcamp.com/",
+        "X-Requested-With": "XMLHttpRequest",
+    }
+
 
 # ==============================================================================
 # ФАЙЛЫ
@@ -111,7 +134,6 @@ def extract_subdomain(target):
 
 
 def _is_cf_title(t):
-    """True, если заголовок похож на Cloudflare-заглушку."""
     if not t:
         return True
     low = t.lower().strip()
@@ -317,7 +339,6 @@ def _extract_og(html_text, prop):
 
 
 def _title_from_tralbum(html_text):
-    """Извлекает title из data-tralbum JSON."""
     m = re.search(r'data-tralbum=["\']([^"\']+)["\']', html_text)
     if not m:
         return ""
@@ -326,7 +347,6 @@ def _title_from_tralbum(html_text):
     except Exception:
         return ""
 
-    # Разные варианты: current.title, current.album_title, album_title, title
     current = tr.get("current") or {}
     for key in ("title", "album_title"):
         if isinstance(current, dict) and current.get(key):
@@ -338,48 +358,32 @@ def _title_from_tralbum(html_text):
 
 
 def _title_from_url(url):
-    """Fallback: собираем название из slug URL."""
     try:
         slug = url.rstrip("/").split("/")[-1].split("?")[0]
-        # Отбрасываем "album"/"track" и подобное
         return slug.replace("-", " ").replace("_", " ").title()
     except Exception:
         return ""
 
 
 def _extract_title(html_text, url=""):
-    """Извлекает название релиза.
-
-    Приоритет:
-      1. data-tralbum JSON -> current.title (приходит с реальной страницей)
-      2. og:title (отфильтровываем Cloudflare-заглушки)
-      3. <title> (тот же фильтр)
-      4. slug из URL
-    """
-    # 1. data-tralbum
     title = _title_from_tralbum(html_text)
     if title and not _is_cf_title(title):
         return title
 
-    # 2. og:title
     og_title = _extract_og(html_text, "title")
     if og_title and not _is_cf_title(og_title):
-        # og:title часто вида "The Disconnect | Session Victim"
         return og_title.split("|")[0].strip()
 
-    # 3. <title>
     m = re.search(r'<title>([^<]+)</title>', html_text, re.I)
     if m:
         t = html_mod.unescape(m.group(1)).split("|")[0].strip()
         if t and not _is_cf_title(t):
             return t
 
-    # 4. slug из URL
     return _title_from_url(url)
 
 
 def _extract_artist_from_page(html_text):
-    """Извлекает имя артиста из og:site_name с фильтром от Cloudflare."""
     a = _extract_og(html_text, "site_name")
     if a and not _is_cf_title(a):
         return a.split("|")[0].strip()
@@ -387,7 +391,7 @@ def _extract_artist_from_page(html_text):
 
 
 # ==============================================================================
-# СБОР ПУТЕЙ РЕЛИЗОВ С /music
+# ПАРСИНГ АРТИСТОВ / ЛЕЙБЛОВ
 # ==============================================================================
 def _collect_release_paths(subdomain, session):
     base = f"https://{subdomain}.bandcamp.com"
@@ -411,9 +415,7 @@ def _collect_release_paths(subdomain, session):
         html_text = r.text
 
         if page == 1:
-            # Сначала пробуем взять имя артиста из tralbum / og:site_name
             artist_name = _extract_artist_from_page(html_text) or subdomain
-            # Fallback: из data-client-items первого элемента — имя бэнда
             if not artist_name or artist_name == subdomain:
                 cm = re.search(r'data-client-items="([^"]+)"', html_text)
                 if cm:
@@ -448,9 +450,6 @@ def _collect_release_paths(subdomain, session):
     return all_paths, artist_name
 
 
-# ==============================================================================
-# FALLBACK ЧЕРЕЗ py_bandcamp
-# ==============================================================================
 def _try_pybandcamp_fallback(url):
     if not PYBANDCAMP_AVAILABLE:
         return None
@@ -464,9 +463,6 @@ def _try_pybandcamp_fallback(url):
     return None
 
 
-# ==============================================================================
-# СБОР РЕЛИЗОВ С АРТИСТА
-# ==============================================================================
 def fetch_releases_from_artist(target):
     subdomain = extract_subdomain(target)
     if not subdomain:
@@ -507,9 +503,7 @@ def fetch_releases_from_artist(target):
             if not release_date:
                 release_date = _try_pybandcamp_fallback(url)
 
-            # Название — приоритетно из data-tralbum
             title = _extract_title(html_text, url=url)
-
             image = _extract_og(html_text, "image")
             page_artist = _extract_artist_from_page(html_text)
             credits_artist = page_artist or artist_name
@@ -537,9 +531,197 @@ def fetch_releases_from_artist(target):
     return releases
 
 
+# ==============================================================================
+# ПАРСИНГ ЖАНРОВ / ТЕГОВ
+# ==============================================================================
+def _collect_genre_candidates(genre, session):
+    """Собирает кандидатов-релизов по жанру.
+
+    Порядок источников:
+      1. HTML /tag/<genre>?sort_field=date — извлекаем data-blob JSON и ссылки
+      2. Discover API — /api/discover/3/get_web и get_cards
+    """
+    candidates = []
+    seen = set()
+
+    # --- Источник 1: HTML страница тега с сортировкой по дате ---
+    tag_url = f"https://bandcamp.com/tag/{genre}?sort_field=date"
+    print(f"   📄 {tag_url}")
+
+    html_text = ""
+    try:
+        r = session.get(tag_url, headers=_headers_html(), timeout=30)
+        if r.status_code == 200:
+            html_text = r.text
+        else:
+            print(f"      ⚠️ HTTP {r.status_code}")
+    except Exception as e:
+        print(f"      ⚠️ {e}")
+
+    if html_text:
+        # 1.1 data-blob JSON
+        blob_m = re.search(r'data-blob="([^"]+)"', html_text)
+        if blob_m:
+            try:
+                blob = json.loads(html_mod.unescape(blob_m.group(1)))
+                items = (
+                    blob.get("hub_data", {}).get("dig_deeper", {}).get("items", [])
+                    or blob.get("tab_data", {}).get("dig_deeper", {}).get("items", [])
+                    or blob.get("dig_deeper", {}).get("items", [])
+                    or blob.get("items", [])
+                    or blob.get("results", [])
+                )
+                for it in items:
+                    link = it.get("tralbum_url") or it.get("link") or it.get("page_url")
+                    if not link:
+                        continue
+                    link = link.split("?")[0]
+                    if not link.startswith("http") or link in seen:
+                        continue
+                    seen.add(link)
+                    candidates.append({
+                        "link": link,
+                        "title": it.get("title") or it.get("primary_text") or it.get("album_title") or "",
+                        "artist": it.get("artist_name") or it.get("artist") or it.get("secondary_text") or "",
+                        "image": it.get("image") or it.get("album_art") or "",
+                    })
+            except Exception as e:
+                print(f"      ⚠️ data-blob: {e}")
+
+        # 1.2 Прямой regex по ссылкам на релизы
+        if not candidates:
+            for m in re.finditer(
+                r'https://[a-zA-Z0-9\-_]+\.bandcamp\.com/(?:album|track)/[a-zA-Z0-9\-_]+',
+                html_text
+            ):
+                link = m.group(0).split("?")[0]
+                if link in seen:
+                    continue
+                seen.add(link)
+                candidates.append({"link": link, "title": "", "artist": "", "image": ""})
+
+    # --- Источник 2: Discover API ---
+    if not candidates:
+        print(f"   🔎 Fallback: discover API...")
+        api_urls = [
+            f"https://bandcamp.com/api/discover/3/get_web?g={genre}&s=new&p=0&f=all",
+            f"https://bandcamp.com/api/discover/3/get_cards?g={genre}&s=new&p=0&f=all",
+            f"https://bandcamp.com/api/discover/3/get_web?g={genre}&s=top&p=0&f=all",
+        ]
+        for api_url in api_urls:
+            try:
+                r = session.get(api_url, headers=_headers_json(), timeout=20)
+                if r.status_code != 200:
+                    continue
+                try:
+                    data = r.json()
+                except Exception:
+                    continue
+            except Exception:
+                continue
+
+            results = (
+                data.get("results")
+                or data.get("items")
+                or data.get("cards")
+                or []
+            )
+            for it in results:
+                link = (
+                    it.get("tralbum_url")
+                    or it.get("url")
+                    or it.get("page_url")
+                    or it.get("link")
+                )
+                if not link:
+                    continue
+                link = link.split("?")[0]
+                if not link.startswith("http") or link in seen:
+                    continue
+                seen.add(link)
+                candidates.append({
+                    "link": link,
+                    "title": it.get("album_title") or it.get("title") or it.get("primary_text") or "",
+                    "artist": it.get("band_name") or it.get("artist") or it.get("secondary_text") or "",
+                    "image": it.get("album_art") or it.get("image") or "",
+                })
+            if candidates:
+                break
+
+    return candidates[:MAX_GENRE_RELEASES]
+
+
 def fetch_releases_from_genre(genre):
-    """Заглушка для жанров."""
-    return []
+    genre_clean = genre.strip().lower().replace(" ", "-")
+    if not genre_clean:
+        return []
+
+    print(f" 🏷️ [ЖАНР]: {genre_clean}...")
+    releases = []
+    seen_links = set()
+
+    with ccr.Session(impersonate="chrome120") as session:
+        print(f"\n   ── Этап 1: сбор кандидатов ──")
+        candidates = _collect_genre_candidates(genre_clean, session)
+        print(f"   Кандидатов: {len(candidates)}")
+
+        if not candidates:
+            print("   ⚠️ Не удалось собрать ни одного кандидата.")
+            return []
+
+        print(f"\n   ── Этап 2: парсинг страниц релизов ──")
+        for i, cand in enumerate(candidates, 1):
+            url = cand["link"]
+            if url in seen_links:
+                continue
+            seen_links.add(url)
+
+            print(f"\n   [{i}/{len(candidates)}] {url}")
+
+            try:
+                r = session.get(url, headers=_headers_html(), timeout=30)
+            except Exception as e:
+                print(f"      ⚠️ {e}")
+                continue
+
+            if r.status_code != 200:
+                print(f"      ⚠️ HTTP {r.status_code}")
+                continue
+
+            html_text = r.text
+            release_date = parse_date_from_html(html_text)
+            if not release_date:
+                release_date = _try_pybandcamp_fallback(url)
+
+            title = _extract_title(html_text, url=url) or cand.get("title") or ""
+            image = _extract_og(html_text, "image") or cand.get("image") or ""
+            artist = (
+                _extract_artist_from_page(html_text)
+                or cand.get("artist")
+                or "Various Artists"
+            )
+
+            if DEBUG:
+                print(f"      🔍 release_date = {release_date!r}, title = {title!r}")
+
+            releases.append({
+                "title_full": f"{title} by {artist}",
+                "artist": artist,
+                "album_title": title,
+                "image": image,
+                "description": f"New release in #{genre_clean}.",
+                "tags": [genre_clean],
+                "link": url,
+                "genre": genre_clean,
+                "release_date": release_date,
+            })
+
+            print(f"      ✅ {title} — {release_date or 'дата не найдена'}")
+
+            time.sleep(random.uniform(*DELAY_BETWEEN_RELEASES))
+
+    print(f"\n   ИТОГО релизов в жанре '{genre_clean}': {len(releases)}")
+    return releases
 
 
 def is_release_date_valid(release_date):
@@ -624,6 +806,7 @@ def main():
     releases = []
     seen_links = set()
 
+    # Артисты/лейблы
     for target in TARGET_ARTISTS_AND_LABELS:
         if target.strip():
             for r in fetch_releases_from_artist(target):
@@ -631,6 +814,7 @@ def main():
                     seen_links.add(r["link"])
                     releases.append(r)
 
+    # Жанры
     for genre in GENRES:
         if genre.strip():
             for r in fetch_releases_from_genre(genre):
