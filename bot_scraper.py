@@ -23,11 +23,11 @@ except ImportError:
 # НАСТРОЙКИ
 # ==============================================================================
 GENRES = [
-    "ambient"
+    # "ambient"
 ]
 
 TARGET_ARTISTS_AND_LABELS = [
-    # "https://sessionvictim.bandcamp.com"
+    "https://sessionvictim.bandcamp.com"
 ]
 
 MAX_DAYS_AGO = 2
