@@ -27,7 +27,7 @@ GENRES = [
 ]
 
 TARGET_ARTISTS_AND_LABELS = [
-    "https://sessionvictim.bandcamp.com"
+    # "https://sessionvictim.bandcamp.com"
 ]
 
 MAX_DAYS_AGO = 2
@@ -50,7 +50,7 @@ MAX_GENRE_RELEASES = 60
 GENRE_USE_API_DATE = True
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "@bc_ambient")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 DEBUG = True
 
