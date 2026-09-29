@@ -47,6 +47,17 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "@bc_ambient")
 
 DEBUG = True
 
+# Заголовки-заглушки Cloudflare, которые нельзя использовать как название релиза
+CF_TITLE_MARKERS = (
+    "client challenge",
+    "just a moment",
+    "attention required",
+    "access denied",
+    "checking your browser",
+    "please wait",
+    "ddos protection",
+)
+
 # ==============================================================================
 # ФАЙЛЫ
 # ==============================================================================
@@ -97,6 +108,14 @@ def extract_subdomain(target):
     target = target.strip().lower()
     target = target.replace("https://", "").replace("http://", "")
     return target.split('.')[0].split('/')[0]
+
+
+def _is_cf_title(t):
+    """True, если заголовок похож на Cloudflare-заглушку."""
+    if not t:
+        return True
+    low = t.lower().strip()
+    return any(m in low for m in CF_TITLE_MARKERS)
 
 
 def _strip_tags(text):
@@ -165,11 +184,9 @@ def _find_date_in_dict(d, keys=("release_date", "album_release_date",
 
 
 def parse_date_from_html(html_text):
-    """Надёжный парсер даты из HTML страницы релиза Bandcamp."""
     if not html_text:
         return None
 
-    # 1. data-tralbum
     m = re.search(r'data-tralbum=["\']([^"\']+)["\']', html_text)
     if m:
         try:
@@ -180,7 +197,6 @@ def parse_date_from_html(html_text):
         except Exception:
             pass
 
-    # 2. JSON-LD
     for ld_raw in re.findall(
         r'<script[^>]*type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
         html_text, re.I | re.S
@@ -208,13 +224,11 @@ def parse_date_from_html(html_text):
         except Exception:
             pass
 
-    # 3. <time datetime="...">
     for dt in re.findall(r'<time[^>]*datetime=["\']([^"\']+)["\']', html_text, re.I):
         parsed = _try_parse_date_string(dt)
         if parsed:
             return parsed
 
-    # 4. bc-page-properties
     m = re.search(
         r'<meta\s+name=["\']bc-page-properties["\']\s+content=["\']([^"\']+)["\']',
         html_text, re.I
@@ -228,7 +242,6 @@ def parse_date_from_html(html_text):
         except Exception:
             pass
 
-    # 5. tralbum-credits
     m = re.search(
         r'class=["\'][^"\']*tralbum-credits[^"\']*["\'][^>]*>(.*?)</div>',
         html_text, re.I | re.S
@@ -244,7 +257,6 @@ def parse_date_from_html(html_text):
             if parsed:
                 return parsed
 
-    # 6. og:description / meta description
     for meta_re in (
         r'<meta\s+property=["\']og:description["\']\s+content=["\']([^"\']+)["\']',
         r'<meta\s+name=["\']description["\']\s+content=["\']([^"\']+)["\']',
@@ -261,7 +273,6 @@ def parse_date_from_html(html_text):
                 if parsed:
                     return parsed
 
-    # 7. Общий regex по тексту без тегов
     text_only = _strip_tags(html_text)
     for pat in (
         r'released?\s+(?:on\s+)?([A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4})',
@@ -273,7 +284,6 @@ def parse_date_from_html(html_text):
             if parsed:
                 return parsed
 
-    # 8. itemprop datePublished
     for pat in (
         r'itemprop=["\']datePublished["\'][^>]*content=["\']([^"\']+)["\']',
         r'content=["\']([^"\']+)["\'][^>]*itemprop=["\']datePublished["\']',
@@ -284,7 +294,6 @@ def parse_date_from_html(html_text):
             if parsed:
                 return parsed
 
-    # 9. JS-переменные
     for raw in re.findall(
         r'(?:album_release_date|release_date|current_release_date|original_release_date)'
         r'"?\s*[:=]\s*"([^"]+)"',
@@ -307,33 +316,80 @@ def _extract_og(html_text, prop):
     return ""
 
 
-def _extract_title(html_text):
-    """Извлекает название релиза из og:title или <title>."""
-    t = _extract_og(html_text, "title")
-    if t:
-        return t
-    m = re.search(r'<title>([^<]+)</title>', html_text, re.I)
-    if m:
-        return html_mod.unescape(m.group(1)).split("|")[0].strip()
+def _title_from_tralbum(html_text):
+    """Извлекает title из data-tralbum JSON."""
+    m = re.search(r'data-tralbum=["\']([^"\']+)["\']', html_text)
+    if not m:
+        return ""
+    try:
+        tr = json.loads(html_mod.unescape(m.group(1)))
+    except Exception:
+        return ""
+
+    # Разные варианты: current.title, current.album_title, album_title, title
+    current = tr.get("current") or {}
+    for key in ("title", "album_title"):
+        if isinstance(current, dict) and current.get(key):
+            return str(current[key]).strip()
+    for key in ("album_title", "title"):
+        if tr.get(key):
+            return str(tr[key]).strip()
     return ""
 
 
+def _title_from_url(url):
+    """Fallback: собираем название из slug URL."""
+    try:
+        slug = url.rstrip("/").split("/")[-1].split("?")[0]
+        # Отбрасываем "album"/"track" и подобное
+        return slug.replace("-", " ").replace("_", " ").title()
+    except Exception:
+        return ""
+
+
+def _extract_title(html_text, url=""):
+    """Извлекает название релиза.
+
+    Приоритет:
+      1. data-tralbum JSON -> current.title (приходит с реальной страницей)
+      2. og:title (отфильтровываем Cloudflare-заглушки)
+      3. <title> (тот же фильтр)
+      4. slug из URL
+    """
+    # 1. data-tralbum
+    title = _title_from_tralbum(html_text)
+    if title and not _is_cf_title(title):
+        return title
+
+    # 2. og:title
+    og_title = _extract_og(html_text, "title")
+    if og_title and not _is_cf_title(og_title):
+        # og:title часто вида "The Disconnect | Session Victim"
+        return og_title.split("|")[0].strip()
+
+    # 3. <title>
+    m = re.search(r'<title>([^<]+)</title>', html_text, re.I)
+    if m:
+        t = html_mod.unescape(m.group(1)).split("|")[0].strip()
+        if t and not _is_cf_title(t):
+            return t
+
+    # 4. slug из URL
+    return _title_from_url(url)
+
+
 def _extract_artist_from_page(html_text):
-    """Извлекает имя артиста из og:site_name."""
+    """Извлекает имя артиста из og:site_name с фильтром от Cloudflare."""
     a = _extract_og(html_text, "site_name")
-    if a:
+    if a and not _is_cf_title(a):
         return a.split("|")[0].strip()
     return ""
 
 
 # ==============================================================================
-# СБОР ПУТЕЙ РЕЛИЗОВ С /music (С ПАГИНАЦИЕЙ)
+# СБОР ПУТЕЙ РЕЛИЗОВ С /music
 # ==============================================================================
 def _collect_release_paths(subdomain, session):
-    """Собирает все пути /album/... и /track/... со страниц /music?page=N.
-
-    Возвращает (set_of_paths, artist_name).
-    """
     base = f"https://{subdomain}.bandcamp.com"
     all_paths = set()
     artist_name = subdomain
@@ -355,10 +411,22 @@ def _collect_release_paths(subdomain, session):
         html_text = r.text
 
         if page == 1:
+            # Сначала пробуем взять имя артиста из tralbum / og:site_name
             artist_name = _extract_artist_from_page(html_text) or subdomain
+            # Fallback: из data-client-items первого элемента — имя бэнда
+            if not artist_name or artist_name == subdomain:
+                cm = re.search(r'data-client-items="([^"]+)"', html_text)
+                if cm:
+                    try:
+                        items = json.loads(html_mod.unescape(cm.group(1)))
+                        if items:
+                            band = items[0].get("band_name") or items[0].get("band")
+                            if band:
+                                artist_name = band
+                    except Exception:
+                        pass
             print(f"   Артист: {artist_name}")
 
-        # Ищем пути в href и в JS-полях
         new_paths = set()
         for m in re.finditer(
             r'(?:href="|"page_url"\s*:\s*"|"title_link"\s*:\s*")(/(?:album|track)/[a-zA-Z0-9_\-]+)',
@@ -384,7 +452,6 @@ def _collect_release_paths(subdomain, session):
 # FALLBACK ЧЕРЕЗ py_bandcamp
 # ==============================================================================
 def _try_pybandcamp_fallback(url):
-    """Пробует получить дату через py_bandcamp.album_to_release."""
     if not PYBANDCAMP_AVAILABLE:
         return None
     try:
@@ -398,7 +465,7 @@ def _try_pybandcamp_fallback(url):
 
 
 # ==============================================================================
-# СБОР РЕЛИЗОВ С АРТИСТА (ОСНОВНАЯ ФУНКЦИЯ)
+# СБОР РЕЛИЗОВ С АРТИСТА
 # ==============================================================================
 def fetch_releases_from_artist(target):
     subdomain = extract_subdomain(target)
@@ -410,9 +477,7 @@ def fetch_releases_from_artist(target):
 
     releases = []
 
-    # Одна постоянная сессия для всех запросов — сохраняем Cloudflare-cookie
     with ccr.Session(impersonate="chrome120") as session:
-        # 1. Собираем все пути релизов
         print(f"\n   ── Этап 1: сбор путей с /music ──")
         paths, artist_name = _collect_release_paths(subdomain, session)
         print(f"   Всего путей: {len(paths)}")
@@ -421,7 +486,6 @@ def fetch_releases_from_artist(target):
             print("   ⚠️ Не удалось собрать ни одного релиза.")
             return []
 
-        # 2. Для каждого пути — загружаем страницу и парсим дату
         print(f"\n   ── Этап 2: парсинг страниц релизов ──")
         for i, path in enumerate(sorted(paths), 1):
             url = f"{base}{path}"
@@ -441,15 +505,17 @@ def fetch_releases_from_artist(target):
             release_date = parse_date_from_html(html_text)
 
             if not release_date:
-                # Fallback через py_bandcamp
                 release_date = _try_pybandcamp_fallback(url)
 
-            title = _extract_title(html_text) or path.split("/")[-1].replace("-", " ").title()
+            # Название — приоритетно из data-tralbum
+            title = _extract_title(html_text, url=url)
+
             image = _extract_og(html_text, "image")
-            credits_artist = _extract_artist_from_page(html_text) or artist_name
+            page_artist = _extract_artist_from_page(html_text)
+            credits_artist = page_artist or artist_name
 
             if DEBUG:
-                print(f"      🔍 release_date = {release_date!r}")
+                print(f"      🔍 release_date = {release_date!r}, title = {title!r}")
 
             releases.append({
                 "title_full": f"{title} by {credits_artist}",
@@ -472,7 +538,7 @@ def fetch_releases_from_artist(target):
 
 
 def fetch_releases_from_genre(genre):
-    """Заглушка для жанров — при необходимости допишите аналогично."""
+    """Заглушка для жанров."""
     return []
 
 
