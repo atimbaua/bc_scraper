@@ -6,7 +6,6 @@ import random
 import html as html_mod
 import re
 from datetime import datetime, timezone, date
-from urllib.parse import urljoin
 
 # Транспорт для py_bandcamp (используется только в fallback)
 os.environ["PYBANDCAMP_TRANSPORT"] = "curl_cffi"
@@ -41,14 +40,13 @@ CSV_FILE = "releases_data.csv"
 DELAY_BETWEEN_RELEASES = (1.0, 2.0)
 DELAY_BETWEEN_PAGES = (2.0, 3.5)
 MAX_PAGES_PER_ARTIST = 30
-MAX_GENRE_RELEASES = 60        # сколько кандидатов из жанра максимум обрабатывать
+MAX_GENRE_RELEASES = 60
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "@bc_ambient")
 
 DEBUG = True
 
-# Заголовки-заглушки Cloudflare, которые нельзя использовать как название релиза
 CF_TITLE_MARKERS = (
     "client challenge",
     "just a moment",
@@ -76,9 +74,12 @@ def _headers_json():
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         "Accept": "application/json, text/javascript, */*; q=0.01",
         "Accept-Language": "en-US,en;q=0.9",
-        "Referer": "https://bandcamp.com/",
+        "Referer": "https://bandcamp.com/discover/ambient",
         "Origin": "https://bandcamp.com",
         "X-Requested-With": "XMLHttpRequest",
+        "Sec-Fetch-Dest": "empty",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Site": "same-origin",
     }
 
 
@@ -392,7 +393,7 @@ def _extract_artist_from_page(html_text):
 
 
 # ==============================================================================
-# ПАРСИНГ АРТИСТОВ / ЛЕЙБЛОВ
+# ПАРСИНГ АРТИСТОВ / ЛЕЙБЛОВ (без изменений)
 # ==============================================================================
 def _collect_release_paths(subdomain, session):
     base = f"https://{subdomain}.bandcamp.com"
@@ -533,150 +534,186 @@ def fetch_releases_from_artist(target):
 
 
 # ==============================================================================
-# ПАРСИНГ ЖАНРОВ / ТЕГОВ — через discover_web API
+# ПАРСИНГ ЖАНРОВ / ТЕГОВ — несколько стратегий
 # ==============================================================================
-def _collect_genre_candidates(genre, session):
-    """Собирает кандидатов-релизов по жанру через API discover_web."""
-    candidates = []
-    seen = set()
-
-    print(f"   🔎 POST запрос к API discover_web для жанра '{genre}'...")
-    api_url = "https://bandcamp.com/api/discover/1/discover_web"
-
-    # Параметры запроса (на основе документации и примеров)
-    payload = {
-        "filters": {
-            "format": "all",
-            "genre": genre,
-            "location": 0,
-            "sort": "new",
-            "tag_slug": genre,
-        },
-        "page": 1,
-    }
-
+def _try_get_web_api(genre, session):
+    """Стратегия 1: старый GET-эндпоинт /api/discover/3/get_web."""
+    print(f"   🔎 Стратегия 1: GET /api/discover/3/get_web")
+    url = f"https://bandcamp.com/api/discover/3/get_web?p=0&s=new&g={genre}&f=all"
     try:
-        r = session.post(
-            api_url,
-            json=payload,
-            headers={
-                **_headers_json(),
-                "Content-Type": "application/json",
-            },
-            timeout=20,
-        )
-        print(f"      HTTP {r.status_code}")
+        r = session.get(url, headers=_headers_json(), timeout=20)
+        print(f"      HTTP {r.status_code}, len={len(r.text)}")
         if r.status_code == 200:
             try:
                 data = r.json()
-                # Ищем items в разных возможных полях ответа
-                items = (
-                    data.get("items")
-                    or data.get("results")
-                    or data.get("cards")
-                    or []
-                )
-                for it in items:
-                    link = (
-                        it.get("tralbum_url")
-                        or it.get("url")
-                        or it.get("page_url")
-                        or it.get("link")
-                    )
-                    if not link:
-                        continue
-                    link = link.split("?")[0]
-                    if link in seen:
-                        continue
-                    seen.add(link)
-                    candidates.append({
-                        "link": link,
-                        "title": (
-                            it.get("album_title")
-                            or it.get("title")
-                            or it.get("primary_text")
-                            or ""
-                        ),
-                        "artist": (
-                            it.get("band_name")
-                            or it.get("artist")
-                            or it.get("secondary_text")
-                            or ""
-                        ),
-                        "image": (
-                            it.get("album_art")
-                            or it.get("image")
-                            or ""
-                        ),
-                    })
-                print(f"      ✅ Найдено {len(candidates)} кандидатов через API")
+                items = data.get("items", [])
+                print(f"      items: {len(items)}")
+                if items:
+                    return items
             except Exception as e:
-                print(f"      ⚠️ Ошибка парсинга JSON: {e}")
-                # Логируем начало ответа для отладки
-                print(f"      📄 Ответ: {r.text[:300]}")
-        else:
-            print(f"      ⚠️ HTTP {r.status_code}")
-            print(f"      📄 Ответ: {r.text[:300]}")
+                print(f"      ⚠️ JSON: {e}, первые 200 символов: {r.text[:200]}")
     except Exception as e:
-        print(f"      ⚠️ Ошибка запроса: {e}")
+        print(f"      ⚠️ {e}")
+    return []
 
-    if candidates:
-        return candidates[:MAX_GENRE_RELEASES]
 
-    # Fallback: попробуем HTML-страницу discover (на случай, если POST не сработал)
-    print(f"   📄 Fallback: парсинг HTML страницы discover...")
-    html_url = f"https://bandcamp.com/discover/{genre}?s=new&p=digital"
-    try:
-        r = session.get(html_url, headers=_headers_html(), timeout=30)
-        if r.status_code == 200:
-            html_text = r.text
-            # Пытаемся найти data-blob
-            blob_m = re.search(r'data-blob="([^"]+)"', html_text)
-            if blob_m:
+def _try_discover_web_api(genre, session):
+    """Стратегия 2: POST /api/discover/1/discover_web с разными payload."""
+    print(f"   🔎 Стратегия 2: POST /api/discover/1/discover_web")
+
+    payloads = [
+        # Вариант A: filters как объект (как у нас было)
+        {
+            "filters": {
+                "format": "all",
+                "genre": genre,
+                "location": 0,
+                "sort": "new",
+                "tag_slug": genre,
+            },
+            "page": 1,
+        },
+        # Вариант B: filters как список
+        {
+            "filters": [
+                {"field": "genre", "value": genre},
+                {"field": "sort", "value": "new"},
+            ],
+            "page": 1,
+        },
+        # Вариант C: параметры в корне
+        {
+            "genre": genre,
+            "sort": "new",
+            "page": 1,
+        },
+    ]
+
+    for idx, payload in enumerate(payloads):
+        print(f"      Пробуем payload #{idx+1}: {json.dumps(payload)[:120]}...")
+        try:
+            r = session.post(
+                "https://bandcamp.com/api/discover/1/discover_web",
+                json=payload,
+                headers={**_headers_json(), "Content-Type": "application/json"},
+                timeout=20,
+            )
+            print(f"      HTTP {r.status_code}, len={len(r.text)}")
+            if r.status_code == 200:
                 try:
-                    blob = json.loads(html_mod.unescape(blob_m.group(1)))
+                    data = r.json()
                     items = (
-                        blob.get("hub_data", {}).get("dig_deeper", {}).get("items", [])
-                        or blob.get("tab_data", {}).get("dig_deeper", {}).get("items", [])
-                        or blob.get("dig_deeper", {}).get("items", [])
-                        or blob.get("items", [])
+                        data.get("items")
+                        or data.get("results")
+                        or data.get("cards")
+                        or []
                     )
-                    for it in items:
-                        link = it.get("tralbum_url") or it.get("link") or it.get("page_url")
-                        if not link:
-                            continue
-                        link = link.split("?")[0]
-                        if link in seen:
-                            continue
-                        seen.add(link)
-                        candidates.append({
-                            "link": link,
-                            "title": it.get("title") or it.get("primary_text") or "",
-                            "artist": it.get("artist_name") or it.get("artist") or "",
-                            "image": it.get("image") or "",
-                        })
+                    print(f"      items: {len(items)}")
+                    if items:
+                        return items
                 except Exception as e:
-                    print(f"      ⚠️ data-blob: {e}")
+                    print(f"      ⚠️ JSON: {e}, первые 200 символов: {r.text[:200]}")
+            else:
+                print(f"      первые 200 символов: {r.text[:200]}")
+        except Exception as e:
+            print(f"      ⚠️ {e}")
+    return []
 
-            if not candidates:
-                for m in re.finditer(
-                    r'https://[a-zA-Z0-9\-_]+\.bandcamp\.com/(?:album|track)/[a-zA-Z0-9\-_]+',
-                    html_text
-                ):
-                    link = m.group(0).split("?")[0]
-                    if link in seen:
-                        continue
-                    seen.add(link)
-                    candidates.append({"link": link, "title": "", "artist": "", "image": ""})
+
+def _try_html_discover(genre, session):
+    """Стратегия 3: HTML-страница /discover/<genre> + data-blob."""
+    print(f"   🔎 Стратегия 3: HTML /discover/{genre}")
+    url = f"https://bandcamp.com/discover/{genre}?s=new&p=digital"
+    try:
+        r = session.get(url, headers=_headers_html(), timeout=30)
+        print(f"      HTTP {r.status_code}, len={len(r.text)}")
+        if r.status_code != 200:
+            return []
+
+        html_text = r.text
+
+        # 3.1 data-blob
+        blob_m = re.search(r'data-blob="([^"]+)"', html_text)
+        if blob_m:
+            try:
+                blob = json.loads(html_mod.unescape(blob_m.group(1)))
+                items = (
+                    blob.get("hub_data", {}).get("dig_deeper", {}).get("items", [])
+                    or blob.get("tab_data", {}).get("dig_deeper", {}).get("items", [])
+                    or blob.get("dig_deeper", {}).get("items", [])
+                    or blob.get("items", [])
+                )
+                print(f"      data-blob items: {len(items)}")
+                if items:
+                    return items
+            except Exception as e:
+                print(f"      ⚠️ data-blob: {e}")
+
+        # 3.2 Regex по ссылкам
+        links = re.findall(
+            r'https://[a-zA-Z0-9\-_]+\.bandcamp\.com/(?:album|track)/[a-zA-Z0-9\-_]+',
+            html_text
+        )
+        print(f"      regex links: {len(links)}")
+        if links:
+            # Преобразуем в items-подобную структуру
+            return [{"tralbum_url": l} for l in links]
     except Exception as e:
-        print(f"      ⚠️ Ошибка: {e}")
+        print(f"      ⚠️ {e}")
+    return []
 
-    if candidates:
-        print(f"      ✅ Найдено {len(candidates)} кандидатов через HTML")
-    else:
-        print(f"      ❌ Кандидаты не найдены")
 
-    return candidates[:MAX_GENRE_RELEASES]
+def _collect_genre_candidates(genre, session):
+    """Пробует все стратегии по очереди и возвращает первого, кто дал результат."""
+    strategies = [
+        ("get_web", _try_get_web_api),
+        ("discover_web", _try_discover_web_api),
+        ("html_discover", _try_html_discover),
+    ]
+    for name, fn in strategies:
+        print(f"\n   ── Стратегия: {name} ──")
+        items = fn(genre, session)
+        if items:
+            candidates = []
+            seen = set()
+            for it in items:
+                link = (
+                    it.get("tralbum_url")
+                    or it.get("url")
+                    or it.get("page_url")
+                    or it.get("link")
+                )
+                if not link:
+                    continue
+                link = link.split("?")[0]
+                if link in seen:
+                    continue
+                seen.add(link)
+                candidates.append({
+                    "link": link,
+                    "title": (
+                        it.get("album_title")
+                        or it.get("title")
+                        or it.get("primary_text")
+                        or ""
+                    ),
+                    "artist": (
+                        it.get("band_name")
+                        or it.get("artist")
+                        or it.get("secondary_text")
+                        or ""
+                    ),
+                    "image": (
+                        it.get("album_art")
+                        or it.get("image")
+                        or ""
+                    ),
+                })
+            print(f"      ✅ {name}: {len(candidates)} кандидатов")
+            return candidates[:MAX_GENRE_RELEASES]
+        else:
+            print(f"      ❌ {name}: 0 кандидатов")
+    return []
 
 
 def fetch_releases_from_genre(genre):
@@ -691,7 +728,7 @@ def fetch_releases_from_genre(genre):
     with ccr.Session(impersonate="chrome120") as session:
         print(f"\n   ── Этап 1: сбор кандидатов ──")
         candidates = _collect_genre_candidates(genre_clean, session)
-        print(f"   Кандидатов: {len(candidates)}")
+        print(f"   Итого кандидатов: {len(candidates)}")
 
         if not candidates:
             print("   ⚠️ Не удалось собрать ни одного кандидата.")
@@ -834,7 +871,6 @@ def main():
     releases = []
     seen_links = set()
 
-    # Артисты/лейблы
     for target in TARGET_ARTISTS_AND_LABELS:
         if target.strip():
             for r in fetch_releases_from_artist(target):
@@ -842,7 +878,6 @@ def main():
                     seen_links.add(r["link"])
                     releases.append(r)
 
-    # Жанры
     for genre in GENRES:
         if genre.strip():
             for r in fetch_releases_from_genre(genre):
