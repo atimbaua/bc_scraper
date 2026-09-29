@@ -24,17 +24,17 @@ except ImportError:
 # НАСТРОЙКИ
 # ==============================================================================
 GENRES = [
-    # "ambient"
+    "ambient"
 ]
 
 TARGET_ARTISTS_AND_LABELS = [
-    "https://sessionvictim.bandcamp.com"
+    # "https://sessionvictim.bandcamp.com"
 ]
 
-MAX_DAYS_AGO = 30
+MAX_DAYS_AGO = 2
 ALLOW_UPCOMING = True
 
-MAX_POSTS_PER_RUN = 5
+MAX_POSTS_PER_RUN = 3
 POSTED_FILE = "posted_releases.json"
 CSV_FILE = "releases_data.csv"
 
